@@ -1,0 +1,52 @@
+/** One turn in the thread.
+ *
+ * User turns get a bubble, assistant turns do not: the answer is the page, not a
+ * card on it. Assistant markdown goes through remark-gfm because most trading
+ * answers are tables. While the first token is still on its way the word Thinking
+ * shimmers in place of the answer, which for this model is about 1.7 seconds of
+ * reasoning before any content arrives.
+ */
+
+import ReactMarkdown from "react-markdown"
+import remarkGfm from "remark-gfm"
+import type { ChatMessage } from "../lib/sse"
+import ToolTimeline from "./ToolTimeline"
+
+interface MessageProps {
+  message: ChatMessage
+  /** True only for the last assistant turn while its run is still open. */
+  streaming: boolean
+}
+
+export default function Message({ message, streaming }: MessageProps) {
+  if (message.role === "user") {
+    return (
+      <div className="mb-6 flex justify-end" data-user-msg>
+        <div className="max-w-[80%] whitespace-pre-wrap rounded-xl bg-chat-user px-3 py-2 text-base">
+          {message.content}
+        </div>
+      </div>
+    )
+  }
+
+  const tools = message.tools ?? []
+  const waiting = streaming && !message.content
+
+  return (
+    <div className="mb-6 pr-10">
+      <ToolTimeline tools={tools} running={streaming} />
+      {waiting ? (
+        <span className="shimmer text-base">Thinking</span>
+      ) : message.content ? (
+        <div className="md text-base">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+        </div>
+      ) : null}
+      {message.error ? (
+        <div className="mt-3 rounded-xl border border-danger-border px-3 py-2 text-sm text-danger">
+          {message.error}
+        </div>
+      ) : null}
+    </div>
+  )
+}
