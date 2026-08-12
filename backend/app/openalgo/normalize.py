@@ -42,7 +42,18 @@ def to_json(payload: Any, limit: int = MAX_TOOL_CHARS) -> str:
     if not text:
         return '{"ok":false,"error":"no_data"}'
     if len(text) > limit:
-        return text[:limit] + f'... [TRUNCATED {len(text) - limit} chars]'
+        # Cutting mid-string would hand the model malformed JSON, so the overflow is
+        # reported as a well-formed object instead. A tool hitting this is a design
+        # problem in that tool: shape the payload down before it gets here.
+        dropped = len(text) - limit
+        return json.dumps({
+            "ok": True,
+            "truncated": True,
+            "dropped_chars": dropped,
+            "note": f"Result exceeded {limit} characters and was cut. Narrow the "
+                    "request (filter, or ask for fewer items) to see all of it.",
+            "partial_text": text[:limit],
+        }, ensure_ascii=False)
     return text
 
 
