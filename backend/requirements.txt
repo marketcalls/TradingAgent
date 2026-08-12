@@ -1,0 +1,11 @@
+agno==2.8.7
+litellm==1.79.1
+openalgo==2.0.3
+fastapi>=0.115
+uvicorn[standard]>=0.32
+httpx>=0.28
+pandas>=2.2
+numpy>=1.26
+sqlalchemy>=2.0
+python-dotenv>=1.0
+pydantic>=2.9

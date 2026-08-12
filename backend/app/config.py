@@ -1,0 +1,219 @@
+"""Settings and logging.
+
+Two conventions this project inherits from equity-research-agent:
+  - Logging is plain ASCII on stdout. Agno installs a ColoredRichHandler that emits
+    box-drawing glyphs, so handlers are replaced before any Agent is constructed.
+  - stdout is reconfigured to UTF-8 with errors="replace" because the model emits
+    currency signs and cp1252 consoles raise on them.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+load_dotenv(PROJECT_ROOT / ".env")
+
+
+def _env(name: str, default: str = "") -> str:
+    return (os.getenv(name) or default).strip()
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(_env(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_env(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = _env(name, "true" if default else "false").lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _env_list(name: str, default: str = "") -> list[str]:
+    return [p.strip().upper() for p in _env(name, default).split(",") if p.strip()]
+
+
+def _resolve(path_value: str) -> Path:
+    p = Path(path_value)
+    return p if p.is_absolute() else PROJECT_ROOT / p
+
+
+@dataclass
+class Settings:
+    # OpenAlgo
+    openalgo_api_key: str = ""
+    openalgo_host: str = "http://127.0.0.1:5000"
+    openalgo_ws_url: str = "ws://127.0.0.1:8765"
+    openalgo_api_version: str = "v1"
+    openalgo_timeout: float = 15.0
+    openalgo_instruments_timeout: float = 30.0
+
+    # Model
+    baseten_api_key: str = ""
+    litellm_model: str = "baseten/deepseek-ai/DeepSeek-V4-Flash-0731"
+    litellm_api_base: str = "https://inference.baseten.co/v1"
+    litellm_temperature: float = 0.2
+    litellm_top_p: float = 1.0
+    # This model reasons before it answers. A low cap returns EMPTY content, not short
+    # content, because the whole budget goes to reasoning tokens. Do not lower this.
+    litellm_max_tokens: int = 4096
+    litellm_include_usage: bool = True
+
+    # Risk
+    trading_enabled: bool = False
+    require_analyzer_mode: bool = True
+    default_strategy_name: str = "TradingAgent"
+    max_order_value: float = 100_000.0
+    max_order_quantity: int = 1000
+    max_orders_per_session: int = 25
+    max_price_deviation_pct: float = 20.0
+    duplicate_order_window_sec: int = 10
+    allowed_exchanges: list[str] = field(default_factory=list)
+    allowed_products: list[str] = field(default_factory=list)
+    symbol_denylist: list[str] = field(default_factory=list)
+    kill_switch_file: Path = PROJECT_ROOT / "data" / "KILL"
+
+    # App
+    backend_host: str = "127.0.0.1"
+    backend_port: int = 8088
+    cors_origins: list[str] = field(default_factory=list)
+    log_level: str = "INFO"
+    db_path: Path = PROJECT_ROOT / "data" / "trading.db"
+    audit_dir: Path = PROJECT_ROOT / "data" / "audit"
+    timezone: str = "Asia/Kolkata"
+
+    # Alerts
+    telegram_username: str = ""
+    whatsapp_default_to: str = ""
+
+    @classmethod
+    def load(cls) -> "Settings":
+        return cls(
+            openalgo_api_key=_env("OPENALGO_API_KEY"),
+            openalgo_host=_env("OPENALGO_HOST", "http://127.0.0.1:5000").rstrip("/"),
+            openalgo_ws_url=_env("OPENALGO_WS_URL", "ws://127.0.0.1:8765"),
+            openalgo_api_version=_env("OPENALGO_API_VERSION", "v1"),
+            openalgo_timeout=_env_float("OPENALGO_TIMEOUT", 15.0),
+            openalgo_instruments_timeout=_env_float("OPENALGO_INSTRUMENTS_TIMEOUT", 30.0),
+            baseten_api_key=_env("BASETEN_API_KEY"),
+            litellm_model=_env("LITELLM_MODEL", "baseten/deepseek-ai/DeepSeek-V4-Flash-0731"),
+            litellm_api_base=_env("LITELLM_API_BASE", "https://inference.baseten.co/v1"),
+            litellm_temperature=_env_float("LITELLM_TEMPERATURE", 0.2),
+            litellm_top_p=_env_float("LITELLM_TOP_P", 1.0),
+            litellm_max_tokens=_env_int("LITELLM_MAX_TOKENS", 4096),
+            litellm_include_usage=_env_bool("LITELLM_INCLUDE_USAGE", True),
+            trading_enabled=_env_bool("TRADING_ENABLED", False),
+            require_analyzer_mode=_env_bool("REQUIRE_ANALYZER_MODE", True),
+            default_strategy_name=_env("DEFAULT_STRATEGY_NAME", "TradingAgent"),
+            max_order_value=_env_float("MAX_ORDER_VALUE", 100_000.0),
+            max_order_quantity=_env_int("MAX_ORDER_QUANTITY", 1000),
+            max_orders_per_session=_env_int("MAX_ORDERS_PER_SESSION", 25),
+            max_price_deviation_pct=_env_float("MAX_PRICE_DEVIATION_PCT", 20.0),
+            duplicate_order_window_sec=_env_int("DUPLICATE_ORDER_WINDOW_SEC", 10),
+            allowed_exchanges=_env_list("ALLOWED_EXCHANGES", "NSE,NFO,BSE,BFO,MCX,CDS"),
+            allowed_products=_env_list("ALLOWED_PRODUCTS", "MIS,CNC,NRML"),
+            symbol_denylist=_env_list("SYMBOL_DENYLIST", ""),
+            kill_switch_file=_resolve(_env("KILL_SWITCH_FILE", "data/KILL")),
+            backend_host=_env("BACKEND_HOST", "127.0.0.1"),
+            backend_port=_env_int("BACKEND_PORT", 8088),
+            cors_origins=[o.strip() for o in _env(
+                "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+            ).split(",") if o.strip()],
+            log_level=_env("LOG_LEVEL", "INFO").upper(),
+            db_path=_resolve(_env("DB_PATH", "data/trading.db")),
+            audit_dir=_resolve(_env("AUDIT_DIR", "data/audit")),
+            timezone=_env("TIMEZONE", "Asia/Kolkata"),
+            telegram_username=_env("OPENALGO_TELEGRAM_USERNAME"),
+            whatsapp_default_to=_env("WHATSAPP_DEFAULT_TO"),
+        )
+
+    def missing(self) -> list[str]:
+        names = []
+        if not self.openalgo_api_key:
+            names.append("OPENALGO_API_KEY")
+        if not self.baseten_api_key:
+            names.append("BASETEN_API_KEY")
+        return names
+
+    def kill_switch_engaged(self) -> bool:
+        return self.kill_switch_file.exists()
+
+    def redacted(self) -> dict:
+        def mask(v: str) -> str:
+            return f"{v[:4]}...{v[-4:]}" if len(v) > 12 else ("set" if v else "(missing)")
+        return {
+            "openalgo_host": self.openalgo_host,
+            "openalgo_api_key": mask(self.openalgo_api_key),
+            "baseten_api_key": mask(self.baseten_api_key),
+            "litellm_model": self.litellm_model,
+            "litellm_max_tokens": self.litellm_max_tokens,
+            "trading_enabled": self.trading_enabled,
+            "require_analyzer_mode": self.require_analyzer_mode,
+            "max_order_value": self.max_order_value,
+            "allowed_exchanges": self.allowed_exchanges,
+            "db_path": str(self.db_path),
+        }
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    s = Settings.load()
+    s.db_path.parent.mkdir(parents=True, exist_ok=True)
+    s.audit_dir.mkdir(parents=True, exist_ok=True)
+    return s
+
+
+def setup_logging(level: str | int | None = None) -> None:
+    """Plain ASCII logging. Must run before any Agent is constructed."""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+    resolved = level if level is not None else get_settings().log_level
+    if isinstance(resolved, str):
+        resolved = getattr(logging, resolved.upper(), logging.INFO)
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s %(message)s", "%H:%M:%S")
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(fmt)
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(resolved)
+
+    for name in ("agno", "agno-team", "agno-workflow"):
+        lg = logging.getLogger(name)
+        lg.handlers.clear()
+        lg.propagate = False
+        h = logging.StreamHandler(sys.stdout)
+        h.setFormatter(fmt)
+        lg.addHandler(h)
+        lg.setLevel(logging.WARNING)
+
+    for noisy in ("httpx", "httpcore", "LiteLLM", "litellm", "openai"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+if __name__ == "__main__":
+    setup_logging()
+    import json
+    print(json.dumps(get_settings().redacted(), indent=2, default=str))
+    print("missing:", get_settings().missing() or "none")

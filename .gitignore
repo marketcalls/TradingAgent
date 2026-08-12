@@ -1,0 +1,21 @@
+.env
+data/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+dist/
+.vite/
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# Third-party documentation copied locally for reference only. These belong to their
+# upstream projects (Agno, OpenAlgo) and are not redistributed from this repository.
+# They stay on disk for the agent and for offline work; see docs/reference/README.md.
+docs/reference/agno/
+docs/reference/openalgo-api/
+docs/reference/openalgo-prompt/
+docs/reference/reference-app/
