@@ -19,3 +19,6 @@ docs/reference/agno/
 docs/reference/openalgo-api/
 docs/reference/openalgo-prompt/
 docs/reference/reference-app/
+
+# Claude Code session state
+.claude/
