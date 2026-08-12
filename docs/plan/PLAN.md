@@ -710,8 +710,15 @@ OpenAlgo's analyzer (sandbox) mode simulates order responses. The agent:
   converts every subsequent simulated order into a real one.
 - Every order response records the mode it was placed under, so the audit trail is unambiguous.
 
-Known limitation to state in the UI: **GTT returns 501 in analyzer mode**. GTT cannot be
-rehearsed; the first GTT order a user places is necessarily live.
+**Correction, measured during build (iteration 7):** the documented "GTT returns 501 in analyzer
+mode" is **not true on this OpenAlgo build**. `placegttorder` in analyzer mode returned
+`{"trigger_id": "GTT-260812-...", "mode": "analyze"}` - GTT is sandboxed like every other order
+type, so it can be rehearsed. The 501 handler is retained and tested against a synthetic
+response, because other builds may still behave as documented.
+
+**Second correction:** the sandbox **rejects MIS orders after 15:15 IST** with "MIS orders
+cannot be placed after square-off time". Any test or example that must run at an arbitrary hour
+uses CNC.
 
 ### 5.5 Audit log
 

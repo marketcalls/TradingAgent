@@ -110,7 +110,11 @@ def _preview_for(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     The model does not produce these numbers; the backend does. That is the point -
     the card must show something the model cannot get wrong.
     """
-    preview: dict[str, Any] = {"analyzer_mode": client.analyzer_mode()}
+    # `mode` is the canonical key the confirmation card reads to decide whether to paint
+    # itself as a live order. It must be the mode this order is priced under, not the
+    # UI's polled banner value, which can be stale. analyzer_mode is kept as an alias.
+    current_mode = client.analyzer_mode()
+    preview: dict[str, Any] = {"mode": current_mode, "analyzer_mode": current_mode}
     if tool_name not in _ORDER_TOOLS:
         return preview
 
@@ -143,7 +147,11 @@ def _preview_for(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
 
         funds = client.call_enveloped("funds")
         if funds.get("ok") and isinstance(funds.get("data"), dict):
-            preview["available_cash"] = funds["data"].get("availablecash")
+            cash = funds["data"].get("availablecash")
+            # available_funds is the key the confirmation card promotes; the alias keeps
+            # the OpenAlgo-native spelling available too.
+            preview["available_funds"] = cash
+            preview["available_cash"] = cash
     except Exception:  # noqa: BLE001
         log.warning("preview failed for %s", tool_name, exc_info=True)
     return preview
@@ -162,6 +170,7 @@ async def _pump(stream, request: Request, on_complete=None) -> AsyncIterator[str
     """Translate agno run events into the SSE contract."""
     run_id: str | None = None
     terminal = False
+    paused = False
     errored_tools: set[str] = set()
 
     try:
@@ -170,7 +179,8 @@ async def _pump(stream, request: Request, on_complete=None) -> AsyncIterator[str
             if run_id is None:
                 run_id = getattr(ev, "run_id", None)
 
-            if await request.is_disconnected():
+            # Do not cancel a paused run: it is waiting for the user, not stuck.
+            if not paused and await request.is_disconnected():
                 if run_id:
                     agent.cancel_run(run_id)
                 return
@@ -219,13 +229,20 @@ async def _pump(stream, request: Request, on_complete=None) -> AsyncIterator[str
 
             elif name == "RunPaused":
                 terminal = True
+                paused = True
                 reqs = list(getattr(ev, "active_requirements", []) or [])
                 yield sse("confirm", {
                     "run_id": getattr(ev, "run_id", run_id),
                     "session_id": getattr(ev, "session_id", None),
                     "requirements": [_requirement_payload(r) for r in reqs],
                 })
-                return  # the stream ends at a pause; no RunCompleted follows
+                # Do NOT return here. Returning early makes Starlette close this
+                # generator, which throws GeneratorExit into agno's generator; its
+                # cleanup then marks the run CANCELLED and overwrites the paused state
+                # in the database, so the confirm endpoint later finds zero pending
+                # requirements. agno yields nothing after RunPaused, so continuing just
+                # lets the loop end naturally and the run stay paused.
+                continue
 
             elif name == "RunCancelled":
                 terminal = True
@@ -253,6 +270,8 @@ async def _pump(stream, request: Request, on_complete=None) -> AsyncIterator[str
 
     if not terminal:
         yield sse("done", {"reason": "incomplete"})
+    # A paused run deliberately emits no `done`: the confirm event was terminal for this
+    # request and the run is waiting for the user, not finished.
 
 
 SSE_HEADERS = {
@@ -326,6 +345,11 @@ async def chat_confirm(req: ConfirmRequest, request: Request) -> StreamingRespon
     notes = req.notes or {}
     audit = get_audit_log()
     resolved = 0
+    log.info("confirm: run=%s status=%s reqs=%s active=%s decisions=%s",
+             req.run_id, getattr(run, "status", None),
+             len(getattr(run, "requirements", []) or []),
+             len(getattr(run, "active_requirements", []) or []),
+             req.decisions)
     for requirement in list(getattr(run, "active_requirements", []) or []):
         if not requirement.needs_confirmation:
             continue

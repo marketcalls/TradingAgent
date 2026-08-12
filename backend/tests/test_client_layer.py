@@ -59,7 +59,16 @@ def test_constants() -> None:
 def test_normalize() -> None:
     print("\n=== normalize ===")
     check("to_json never empty", to_json("") == '{"ok":false,"error":"no_data"}')
-    check("to_json caps size", len(to_json("x" * 50_000, limit=100)) < 200)
+
+    # Oversized payloads are wrapped in a well-formed envelope rather than cut
+    # mid-string, so the result stays bounded AND parseable.
+    capped = to_json("x" * 50_000, limit=100)
+    check("to_json caps size", len(capped) < 1000, f"{len(capped)} chars")
+    parsed_cap = json.loads(capped)
+    check("a truncated result is still valid JSON",
+          parsed_cap["truncated"] is True and parsed_cap["dropped_chars"] == 49_900
+          and len(parsed_cap["partial_text"]) == 100,
+          f"dropped={parsed_cap['dropped_chars']}")
 
     nan_payload = {"a": float("nan"), "b": [1.0, float("inf")], "c": {"d": float("nan")}}
     text = to_json(nan_payload)

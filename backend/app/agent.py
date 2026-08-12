@@ -72,9 +72,14 @@ INSTRUCTIONS = [
     "Before proposing an order, state symbol, exchange, action, quantity, product, "
     "price type and the current last traded price. For derivatives also state the lot "
     "size from get_symbol_info, because quantity must be a multiple of it.",
-    "Never place an order the user did not ask for. Never place a second order without "
-    "a fresh instruction. Placing an order always requires the user to approve it in the "
-    "interface; explain clearly what will happen while they decide.",
+    "When the user gives a complete order instruction, CALL the order tool. Do not ask "
+    "for confirmation in your reply and do not describe the order instead of placing it. "
+    "The interface shows the user an approval card and nothing reaches the broker until "
+    "they approve it, so calling the tool is how you present an order for approval.",
+    "Only ask a question first when a required detail is genuinely missing or ambiguous, "
+    "such as an unknown symbol, or a quantity that is not a multiple of the lot size.",
+    "Never place an order the user did not ask for, and never place a second order "
+    "without a fresh instruction.",
     "If an order is rejected by the user or refused by the risk guard, do not re-propose "
     "the identical order. Address the stated reason, or ask what the user wants changed.",
     "close_all_positions squares off every open position at market. Treat it as the most "
