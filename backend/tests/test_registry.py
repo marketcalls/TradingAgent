@@ -37,6 +37,7 @@ from app.indicators.registry import (  # noqa: E402
     CATEGORIES,
     REGISTRY,
     IndicatorSpec,
+    get_spec,
     list_specs,
     validate_registry,
 )
@@ -110,10 +111,16 @@ def check_coverage() -> None:
     broken = sorted(s.name for s in REGISTRY.values() if s.status == "broken")
     record("vi and ulcerindex marked broken", PASS if broken == ["ulcerindex", "vi"] else FAIL,
            str(broken))
-    uo = REGISTRY["uo_oscillator"]
-    ok = uo.status == "alias" and uo.alias_of == "ultimate_oscillator"
+    uo = get_spec("uo_oscillator")
+    ok = uo is not None and uo.status == "alias" and uo.alias_of == "ultimate_oscillator"
     record("uo_oscillator marked alias", PASS if ok else FAIL,
            f"status={uo.status} alias_of={uo.alias_of}")
+
+    two = sorted(s.name for s in REGISTRY.values() if s.needs_second_series)
+    record("correlation and beta need a second series",
+           PASS if two == ["beta", "correlation"] else FAIL, str(two))
+    record("get_spec returns None for an unknown name",
+           PASS if get_spec("no_such_indicator") is None else FAIL)
 
 
 # ---------------------------------------------------------------------------
