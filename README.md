@@ -86,17 +86,42 @@ Everything else has a working default. `.env` is gitignored.
 
 ## Run
 
-```bash
-# terminal 1
-cd backend && python -m uvicorn app.main:app --port 8088
+Start OpenAlgo first and log in with your broker - the agent checks the connection on
+startup and every tool depends on it.
 
-# terminal 2
-cd frontend && npm run dev
+```bash
+# terminal 1 - backend on :8088
+cd backend
+python -m uvicorn app.main:app --port 8088
+
+# terminal 2 - frontend on :5173
+cd frontend
+npm run dev
 ```
 
-Open http://localhost:5173.
+Open **http://localhost:5173**.
 
-To let the agent place orders at all, set `TRADING_ENABLED=true`. Keep
+Use `localhost`, not `127.0.0.1`: Vite binds the hostname only, so
+`http://127.0.0.1:5173` is refused even while the server is up.
+
+The frontend proxies `/api` to `http://127.0.0.1:8088`, so both must be running. If you
+change `BACKEND_PORT` in `.env`, change the proxy target in `frontend/vite.config.ts` to
+match.
+
+Check the backend by itself:
+
+```bash
+curl http://127.0.0.1:8088/api/health
+# {"ok":true,"model":"...","openalgo_connected":true,"broker":"zerodha","trading_enabled":false}
+```
+
+`openalgo_connected: false` means OpenAlgo is not reachable or the API key is wrong;
+nothing else will work until that is true.
+
+Restarting: the backend reads `.env` **once at startup**, so any change to the model,
+tool profile or risk limits needs a restart to take effect. The frontend hot-reloads.
+
+To let the agent place orders at all, set `TRADING_ENABLED=true` and restart. Keep
 `REQUIRE_ANALYZER_MODE=true` until you genuinely intend to trade real money.
 
 To stop everything immediately without restarting, create the kill switch file:
