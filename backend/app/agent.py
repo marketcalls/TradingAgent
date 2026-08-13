@@ -12,8 +12,17 @@ litellm 1.79.1:
     reasoning and content came back None with finish_reason="length" - an empty reply,
     not a truncated one. max_tokens is therefore load-bearing, not a cost dial.
 
-  - Unlike the equity-research sibling, temperature and top_p do NOT need to be None
-    here; Baseten accepts both, so real values are sent.
+  - Sampling parameters are NOT universal, so they are resolved per model rather than
+    sent blindly. Baseten accepts temperature and top_p, so real values go through.
+    OpenAI's gpt-5.6 family rejects top_p outright ("openai does not support
+    parameters: ['top_p']") and accepts temperature only as 1 ("gpt-5 models don't
+    support temperature=0.2"). Both are handled: unsupported parameters come from
+    get_supported_openai_params, and value constraints from sampling_overrides, because
+    no metadata call expresses "this parameter, but only this value".
+
+  - gpt-5.6 also refuses to combine function tools with any reasoning effort except
+    "none" on /v1/chat/completions. Since this agent always sends tools, effort is
+    pinned to "none" for that family and a conflicting .env value is overridden.
 
 Tool scoping is a callable factory rather than a fixed list. That is a safety layer as
 well as a context saving: a session that has not enabled trading has no order tools in
@@ -31,7 +40,7 @@ from agno.models.litellm import LiteLLM
 from agno.run import RunContext
 
 from .config import Settings, get_settings
-from .model_providers import prepare_provider
+from .model_providers import prepare_provider, sampling_overrides
 from .tools.account import AccountTools
 from .tools.indicators import IndicatorTools
 from .tools.market import MarketDataTools
@@ -187,6 +196,16 @@ def build_tool_factory(settings: Settings):
     return get_tools
 
 
+def _supported_params(model_id: str) -> set[str] | None:
+    """What OpenAI-style parameters this model accepts, or None if unknown."""
+    try:
+        import litellm
+        params = litellm.get_supported_openai_params(model=model_id)
+        return set(params) if params else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def build_model(settings: Settings) -> LiteLLM:
     """Build the model from whatever provider LITELLM_MODEL names.
 
@@ -246,12 +265,29 @@ def build_model(settings: Settings) -> LiteLLM:
 
     kwargs: dict[str, Any] = {
         "id": settings.litellm_model,
-        "temperature": settings.litellm_temperature,
-        "top_p": settings.litellm_top_p,
         # For a reasoning model a small cap returns EMPTY content, not short content.
         "max_tokens": settings.litellm_max_tokens,
         "request_params": request_params or None,
     }
+
+    # Sampling parameters are not universal. OpenAI's gpt-5.6 family rejects top_p with
+    #   UnsupportedParamsError: openai does not support parameters: ['top_p']
+    # which fails every request. Ask LiteLLM what this model accepts and send only that;
+    # agno omits a None from the payload, so None is how a parameter is withheld.
+    supported = _supported_params(settings.litellm_model)
+    # Some constraints are about the VALUE, not the parameter, and no metadata call
+    # exposes them - gpt-5 accepts temperature but only the value 1.
+    forced = sampling_overrides(settings.litellm_model)
+    for name, value in (("temperature", settings.litellm_temperature),
+                        ("top_p", settings.litellm_top_p)):
+        if name in forced:
+            kwargs[name] = forced[name]
+            log.info("%s constrains %s; using %r", settings.litellm_model, name, forced[name])
+        elif supported is None or name in supported:
+            kwargs[name] = value
+        else:
+            kwargs[name] = None
+            log.info("%s does not accept %s; withholding it", settings.litellm_model, name)
 
     api_key = settings.resolve_model_api_key()
     if api_key:

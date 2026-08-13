@@ -185,7 +185,42 @@ _MEASURED_REASONING: dict[str, dict] = {
                           "controllable": False,
                           "note": "This model always reasons and the amount cannot be "
                                   "controlled: the provider rejects reasoning_effort."},
+
+    # OpenAI's gpt-5.6 family reasons, but on /v1/chat/completions it refuses to combine
+    # function tools with any reasoning effort other than "none":
+    #   BadRequestError: Function tools with reasoning_effort are not supported for
+    #   gpt-5.6-luna in /v1/chat/completions
+    # and "minimal" is rejected outright as an unsupported value. This agent always
+    # sends tools, so "none" is the ONLY workable setting. Measured on both -luna and
+    # -sol: none works and returns a correct tool call in 1.5-2.3s; minimal, low, medium
+    # and high all fail. allowed_efforts pins the choice so a stray .env cannot break
+    # every request.
+    "gpt-5.6": {"thinks": True, "graded": False, "can_disable": True,
+                "controllable": True, "allowed_efforts": ["none"], "forced_effort": "none",
+                "note": "This model cannot combine tools with reasoning, so thinking is "
+                        "pinned off. Any other effort makes every request fail."},
 }
+
+
+# Sampling constraints that get_supported_openai_params cannot express, because they are
+# about the VALUE rather than the parameter. Keyed by a substring of the model id.
+_SAMPLING_CONSTRAINTS: dict[str, dict] = {
+    # gpt-5 family: LiteLLM raises
+    #   "gpt-5 models (including gpt-5-codex) don't support temperature=0.2.
+    #    Only temperature=1 is supported."
+    # so the project's default of 0.2 fails every request. None withholds the parameter
+    # and lets the model use its own default of 1.
+    "gpt-5": {"temperature": None},
+}
+
+
+def sampling_overrides(model_id: str) -> dict:
+    """Per-model sampling values that must be forced or withheld. {} when unconstrained."""
+    lowered = model_id.lower()
+    for needle, data in _SAMPLING_CONSTRAINTS.items():
+        if needle in lowered:
+            return dict(data)
+    return {}
 
 
 def _measured_override(model_id: str) -> dict | None:

@@ -202,6 +202,24 @@ class Settings:
             build_model.
         """
         value = (self.litellm_reasoning_effort or "").strip().lower()
+
+        # A model may accept only one value regardless of what the .env asks for.
+        # Honour that rather than sending a setting that fails every request.
+        try:
+            from .model_providers import detect_reasoning_support
+            found = detect_reasoning_support(self.litellm_model,
+                                             self.litellm_api_base or None)
+            forced = found.get("forced_effort")
+            if forced:
+                if value and value != forced:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "LITELLM_REASONING_EFFORT=%s is not usable with %s alongside "
+                        "tools; using %r instead.", value, self.litellm_model, forced)
+                return forced
+        except Exception:  # noqa: BLE001
+            pass
+
         if not value:
             return None
         if value not in self.REASONING_EFFORTS:
@@ -234,6 +252,10 @@ class Settings:
         # sending the parameter would fail the request instead of tuning it.
         if not found["thinks"] or not found.get("controllable", found["graded"]):
             options: list[str] = []          # the UI hides the control entirely
+        elif found.get("allowed_efforts"):
+            # A model that accepts only specific values, measured. gpt-5.6 with tools
+            # accepts nothing but "none".
+            options = list(found["allowed_efforts"])
         elif found["graded"]:
             options = ["none", "minimal", "low", "medium", "high"]
             if not found["can_disable"]:
