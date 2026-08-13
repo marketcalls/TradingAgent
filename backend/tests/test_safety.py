@@ -35,15 +35,29 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 class StubClient:
     """Stands in for OpenAlgoClient. No network."""
 
-    def __init__(self, mode: str = "analyze", ltp: float | None = 100.0) -> None:
+    def __init__(self, mode: str = "analyze", ltp: float | None = 100.0,
+                 margin: float | None = 0.0, funds: float = 1_000_000.0) -> None:
         self._mode = mode
         self._ltp = ltp
+        self._margin = margin
+        self._funds = funds
 
     def analyzer_mode(self) -> str:
         return self._mode
 
     def ltp(self, symbol: str, exchange: str) -> float | None:
         return self._ltp
+
+    def call_enveloped(self, method: str, **kwargs):
+        # Only the two the affordability check needs. margin=None simulates the
+        # endpoint being unavailable, which must fail OPEN.
+        if method == "margin":
+            if self._margin is None:
+                return {"ok": False, "error": "margin unavailable"}
+            return {"ok": True, "data": {"total_margin_required": self._margin}}
+        if method == "funds":
+            return {"ok": True, "data": {"availablecash": self._funds}}
+        return {"ok": False, "error": f"unstubbed {method}"}
 
 
 def make_settings(tmp: Path, **over) -> Settings:
@@ -171,6 +185,62 @@ def test_risk(tmp: Path) -> None:
     check("a different session is unaffected",
           g.check_order(**{**BASE, "quantity": 99}, session_id="s2").allowed)
     check("session counter", g.session_order_count("s1") == 3, str(g.session_order_count("s1")))
+
+    # --- ceilings are opt-in ------------------------------------------------
+    # A fixed rupee ceiling cannot suit every account, so 0 disables it. This is the
+    # case that made the agent unusable: one NIFTY futures lot is ~15.8 lakh of
+    # exposure, so ANY cash-sized cap rejected every derivatives order ever placed.
+    g = RiskGuard(make_settings(tmp, max_order_value=0.0, max_order_quantity=0,
+                                max_order_pct_of_funds=0.0), StubClient(ltp=24_400.0))
+    check("no ceiling allows a NIFTY futures lot (65 x 24,400 = 15.86L)",
+          g.check_order(**{**BASE, "symbol": "NIFTY25AUG26FUT", "exchange": "NFO",
+                           "product": "NRML", "quantity": 65}).allowed)
+
+    g = RiskGuard(make_settings(tmp, max_order_value=0.0, max_order_quantity=0,
+                                max_order_pct_of_funds=0.0), StubClient(ltp=24_400.0))
+    check("no ceiling allows a 5 crore order",
+          g.check_order(**{**BASE, "quantity": 20_500}).allowed,
+          "20,500 x 24,400 = 50.02 crore")
+
+    # derivatives get their own ceiling when one is set
+    g = RiskGuard(make_settings(tmp, max_order_value=100_000.0,
+                                max_derivative_order_value=20_000_000.0,
+                                max_order_quantity=0, max_order_pct_of_funds=0.0),
+                  StubClient(ltp=24_400.0))
+    check("derivative ceiling is separate from the cash one",
+          g.check_order(**{**BASE, "symbol": "NIFTY25AUG26FUT", "exchange": "NFO",
+                           "product": "NRML", "quantity": 65}).allowed)
+
+    # --- affordability, the default guard -----------------------------------
+    # 90 percent of 10,00,000 is 9,00,000, so a 9,50,000 margin must be refused.
+    g = RiskGuard(make_settings(tmp, max_order_value=0.0, max_order_quantity=0),
+                  StubClient(ltp=100.0, margin=950_000.0, funds=1_000_000.0))
+    v = g.check_order(**BASE)
+    check("affordability refuses when margin exceeds the allowed share",
+          not v.allowed and v.code == "insufficient_funds", v.code)
+
+    g = RiskGuard(make_settings(tmp, max_order_value=0.0, max_order_quantity=0),
+                  StubClient(ltp=100.0, margin=180_000.0, funds=1_000_000.0))
+    check("affordability allows an order the account can carry",
+          g.check_order(**BASE).allowed, "1.8L margin against 10L funds")
+
+    # scales with the account: the same order on a bigger account is fine
+    g = RiskGuard(make_settings(tmp, max_order_value=0.0, max_order_quantity=0),
+                  StubClient(ltp=100.0, margin=950_000.0, funds=50_000_000.0))
+    check("the same order passes on a larger account",
+          g.check_order(**BASE).allowed, "9.5L margin against 5 crore funds")
+
+    # must FAIL OPEN rather than block real trades on an API hiccup
+    g = RiskGuard(make_settings(tmp, max_order_value=0.0, max_order_quantity=0),
+                  StubClient(ltp=100.0, margin=None))
+    check("affordability fails open when margin is unavailable",
+          g.check_order(**BASE).allowed)
+
+    g = RiskGuard(make_settings(tmp, max_order_value=0.0, max_order_quantity=0,
+                                max_order_pct_of_funds=0.0),
+                  StubClient(ltp=100.0, margin=99_000_000.0, funds=1_000.0))
+    check("MAX_ORDER_PCT_OF_FUNDS=0 disables the affordability check",
+          g.check_order(**BASE).allowed)
 
     # action
     g = RiskGuard(make_settings(tmp), StubClient())

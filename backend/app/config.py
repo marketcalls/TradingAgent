@@ -87,8 +87,17 @@ class Settings:
     trading_enabled: bool = False
     require_analyzer_mode: bool = True
     default_strategy_name: str = "TradingAgent"
-    max_order_value: float = 100_000.0
-    max_order_quantity: int = 1000
+    # Absolute ceilings are OPT-IN, and 0 disables them. A fixed rupee cap cannot be
+    # right for every account: one that suits a retail trader blocks a desk punching
+    # 5 crore, and one that suits the desk protects nobody. The default protection is
+    # account-relative instead - see max_order_pct_of_funds and the affordability
+    # check - and these exist for anyone who wants a hard ceiling on top.
+    max_order_value: float = 0.0             # cash segment, 0 = no ceiling
+    max_derivative_order_value: float = 0.0  # F&O EXPOSURE, 0 = no ceiling
+    max_order_quantity: int = 0              # 0 = no ceiling
+    # The real guard: refuse an order whose required margin exceeds this share of
+    # available funds. Scales to any account size. 0 disables it.
+    max_order_pct_of_funds: float = 90.0
     max_orders_per_session: int = 25
     max_price_deviation_pct: float = 20.0
     duplicate_order_window_sec: int = 10
@@ -132,8 +141,11 @@ class Settings:
             trading_enabled=_env_bool("TRADING_ENABLED", False),
             require_analyzer_mode=_env_bool("REQUIRE_ANALYZER_MODE", True),
             default_strategy_name=_env("DEFAULT_STRATEGY_NAME", "TradingAgent"),
-            max_order_value=_env_float("MAX_ORDER_VALUE", 100_000.0),
-            max_order_quantity=_env_int("MAX_ORDER_QUANTITY", 1000),
+            max_order_value=_env_float("MAX_ORDER_VALUE", 0.0),
+            max_derivative_order_value=_env_float(
+                "MAX_DERIVATIVE_ORDER_VALUE", 0.0),
+            max_order_quantity=_env_int("MAX_ORDER_QUANTITY", 0),
+            max_order_pct_of_funds=_env_float("MAX_ORDER_PCT_OF_FUNDS", 90.0),
             max_orders_per_session=_env_int("MAX_ORDERS_PER_SESSION", 25),
             max_price_deviation_pct=_env_float("MAX_PRICE_DEVIATION_PCT", 20.0),
             duplicate_order_window_sec=_env_int("DUPLICATE_ORDER_WINDOW_SEC", 10),
@@ -320,6 +332,8 @@ class Settings:
             "trading_enabled": self.trading_enabled,
             "require_analyzer_mode": self.require_analyzer_mode,
             "max_order_value": self.max_order_value,
+            "max_derivative_order_value": self.max_derivative_order_value,
+            "max_order_pct_of_funds": self.max_order_pct_of_funds,
             "allowed_exchanges": self.allowed_exchanges,
             "db_path": str(self.db_path),
         }

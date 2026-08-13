@@ -85,9 +85,37 @@ Four independent layers, because only the lower two really hold:
 
 RiskGuard refuses, in order: the kill switch, `TRADING_ENABLED`, live mode, denylisted symbols,
 exchanges outside your allowlist, index symbols (which cannot be traded), products outside your
-allowlist, bad quantities, your per-session order cap, **duplicate orders within 10 seconds**,
-your notional cap, and a **fat-finger guard on any limit price more than 20 percent from the last
-traded price**.
+allowlist, bad quantities, your per-session order cap, **duplicate orders within 10 seconds**, a
+**fat-finger guard on any limit price more than 20 percent from the last traded price**, and
+affordability.
+
+### What "affordability" means, and why there is no rupee cap by default
+
+The size check is **account-relative**, not a fixed number. No absolute rupee cap suits every
+account: one that suits a retail trader blocks a desk punching 5 crore, and one that suits the
+desk protects nobody.
+
+So the default guard is `MAX_ORDER_PCT_OF_FUNDS` (90): refuse an order whose **required margin**
+exceeds that share of available funds.
+
+Margin is the right measure, not notional. Two NIFTY futures lots are **31.8 lakh of exposure but
+only 3.6 lakh of margin** - and it is the margin that has to be in the account. Capping on
+notional rejected every derivatives order ever placed, because one lot of any index instrument
+exceeds any cash-sized limit.
+
+Absolute ceilings still exist and are **off by default** (`0` = no limit). Set them only if you
+want a hard stop on top:
+
+| Setting | Caps |
+|---|---|
+| `MAX_ORDER_PCT_OF_FUNDS` | Required margin as a share of available funds. The default guard |
+| `MAX_ORDER_VALUE` | Cash-segment notional, where notional is the real outlay |
+| `MAX_DERIVATIVE_ORDER_VALUE` | F&O exposure, which is far larger than the margin paid |
+| `MAX_ORDER_QUANTITY` | Raw quantity |
+
+The affordability check **fails open** if the margin or funds endpoint is unavailable. Refusing
+real orders because an endpoint hiccuped is worse than allowing one that has already passed every
+other guard and been approved by a human.
 
 Every order is written to an audit trail twice, before the broker is touched and after, in
 `data/audit/orders-YYYY-MM-DD.jsonl` and a SQLite table. That is the record of what happened and

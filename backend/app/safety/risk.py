@@ -107,6 +107,65 @@ class RiskGuard:
                            reason=f"{s} is in SYMBOL_DENYLIST")
         return ALLOW
 
+    def _check_affordability(self, symbol: str, exchange: str, action: str,
+                             quantity: Any, product: str, price_type: str) -> Verdict:
+        """The primary guard: can this account actually afford this order?
+
+        This replaces the fixed rupee ceilings as the default protection, because no
+        absolute number is right for every account. A cap that suits a retail trader
+        blocks a desk punching 5 crore; one that suits the desk protects nobody. The
+        share of available funds a single order may consume scales to both.
+
+        Margin is the correct measure, not notional. One NIFTY futures lot is about
+        15.8 lakh of exposure but only about 1.8 lakh of margin, and it is the margin
+        that has to be there.
+
+        Fails OPEN on a broker or network error. The alternative is refusing real
+        orders because a quote endpoint hiccuped, and by this point the order has
+        already passed every other guard and a human has approved it.
+        """
+        pct = self.settings.max_order_pct_of_funds
+        if pct <= 0:
+            return ALLOW
+
+        try:
+            leg = {
+                "symbol": C.normalize_symbol(symbol),
+                "exchange": C.normalize_exchange(exchange),
+                "action": C.normalize_action(action) or "BUY",
+                "product": C.normalize_product(product) or "MIS",
+                # 'pricetype', not 'price_type', inside the positions list.
+                "pricetype": C.normalize_price_type(price_type) or "MARKET",
+                "quantity": str(quantity),
+            }
+            margin_res = self._client.call_enveloped("margin", positions=[leg])
+            funds_res = self._client.call_enveloped("funds")
+            if not (margin_res.get("ok") and funds_res.get("ok")):
+                log.warning("affordability check skipped: margin or funds unavailable")
+                return ALLOW
+
+            required = float((margin_res.get("data") or {}).get("total_margin_required") or 0)
+            available = float((funds_res.get("data") or {}).get("availablecash") or 0)
+        except Exception:  # noqa: BLE001
+            log.warning("affordability check skipped", exc_info=True)
+            return ALLOW
+
+        if required <= 0 or available <= 0:
+            return ALLOW
+
+        allowed = available * pct / 100.0
+        if required > allowed:
+            return Verdict(
+                False, code="insufficient_funds",
+                reason=f"this order needs {required:,.2f} of margin, which is more than "
+                       f"the {pct:g} percent of available funds it is allowed to use "
+                       f"({allowed:,.2f} of {available:,.2f}). Reduce the size, or raise "
+                       f"MAX_ORDER_PCT_OF_FUNDS in this application's .env and restart "
+                       f"the backend.",
+                details={"margin_required": required, "available_funds": available,
+                         "allowed": allowed, "pct": pct})
+        return ALLOW
+
     def _check_quantity(self, quantity: Any) -> Verdict:
         try:
             qty = float(quantity)
@@ -116,10 +175,13 @@ class RiskGuard:
         if qty <= 0:
             return Verdict(False, code="bad_quantity",
                            reason=f"quantity must be positive, got {qty}")
-        if qty > self.settings.max_order_quantity:
+        # 0 disables the ceiling; a fixed lot count cannot suit every account.
+        if self.settings.max_order_quantity and qty > self.settings.max_order_quantity:
             return Verdict(False, code="quantity_cap",
                            reason=f"quantity {qty:g} exceeds MAX_ORDER_QUANTITY "
-                                  f"({self.settings.max_order_quantity})")
+                                  f"({self.settings.max_order_quantity}), a ceiling set "
+                                  f"in this application's .env. Set it to 0 to remove "
+                                  f"the limit.")
         return ALLOW
 
     def _check_notional_and_price(self, symbol: str, exchange: str, quantity: Any,
@@ -146,12 +208,31 @@ class RiskGuard:
         reference = limit_price if limit_price else ltp
         if reference:
             notional = qty * reference
-            if notional > self.settings.max_order_value:
+            # Derivatives get their own cap. Sharing one with equity made every F&O
+            # order impossible: a single NIFTY lot is about 15.8 lakh of EXPOSURE
+            # against roughly 1.8 lakh of margin, so any cash-sized limit rejects it.
+            is_derivative = C.normalize_exchange(exchange) in (
+                "NFO", "BFO", "CDS", "BCD", "MCX", "NCDEX", "NCO")
+            cap = (self.settings.max_derivative_order_value if is_derivative
+                   else self.settings.max_order_value)
+            setting = ("MAX_DERIVATIVE_ORDER_VALUE" if is_derivative
+                       else "MAX_ORDER_VALUE")
+            # 0 disables the ceiling. Affordability is the default guard instead.
+            if cap and notional > cap:
+                kind = "exposure" if is_derivative else "notional"
                 return Verdict(False, code="notional_cap",
-                               reason=f"order notional {notional:,.2f} exceeds "
-                                      f"MAX_ORDER_VALUE ({self.settings.max_order_value:,.2f}) "
-                                      f"at a reference price of {reference:,.2f}",
-                               details={"notional": notional, "reference": reference})
+                               reason=f"order {kind} {notional:,.2f} exceeds {setting} "
+                                      f"({cap:,.2f}) at a reference price of "
+                                      f"{reference:,.2f}. This is a limit in this "
+                                      f"application's .env file, not a broker or "
+                                      f"OpenAlgo setting; raising it needs a backend "
+                                      f"restart."
+                                      + (" For derivatives this caps exposure, not the "
+                                         "margin actually required." if is_derivative
+                                         else ""),
+                               details={"notional": notional, "reference": reference,
+                                        "cap": cap, "setting": setting,
+                                        "derivative": is_derivative})
 
         if limit_price and ltp and ltp > 0:
             deviation = abs(limit_price - ltp) / ltp * 100.0
@@ -218,11 +299,15 @@ class RiskGuard:
                 return verdict
 
         if not skip_market_checks:
-            verdict = self._check_notional_and_price(symbol, exchange, quantity,
-                                                     price_type, price)
-            if not verdict.allowed:
-                log.warning("risk refused: %s - %s", verdict.code, verdict.reason)
-                return verdict
+            for verdict in (
+                self._check_notional_and_price(symbol, exchange, quantity,
+                                               price_type, price),
+                self._check_affordability(symbol, exchange, action, quantity,
+                                          product, price_type),
+            ):
+                if not verdict.allowed:
+                    log.warning("risk refused: %s - %s", verdict.code, verdict.reason)
+                    return verdict
 
         action_norm = C.normalize_action(action)
         if action_norm and action_norm not in C.ACTIONS:
