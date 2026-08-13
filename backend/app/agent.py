@@ -213,6 +213,16 @@ def build_model(settings: Settings) -> LiteLLM:
         request_params["stream_options"] = {"include_usage": True}
 
     effort = settings.resolve_reasoning_effort()
+    # Only send it if the provider actually accepts it. Baseten, for one, rejects
+    # reasoning_effort outright with
+    #   UnsupportedParamsError: baseten does not support parameters: ['reasoning_effort']
+    # which fails EVERY request rather than tuning anything.
+    if effort and not settings.reasoning_capability().get("controllable"):
+        log.warning(
+            "LITELLM_REASONING_EFFORT=%s is set, but %s does not accept reasoning_effort. "
+            "Ignoring it; sending it would fail every request.",
+            effort, settings.litellm_model)
+        effort = None
     if effort:
         # request_params is merged last by agno, so this reaches every sync, async and
         # streaming call.

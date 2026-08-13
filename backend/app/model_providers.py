@@ -171,13 +171,20 @@ def patch_ollama_tool_call_roundtrip() -> bool:
 # Models whose real behaviour was MEASURED here and disagrees with LiteLLM's table.
 # Keyed by a substring of the model id. Keep this short and evidence-based.
 _MEASURED_REASONING: dict[str, dict] = {
-    # litellm.supports_reasoning() returns False for this, but it demonstrably reasons:
-    # reasoning_content comes back populated and usage reports reasoning_tokens
-    # (202 at default effort, 1283 at low, 1498 at high). "none" does not disable it.
-    "deepseek-v4-flash": {"thinks": True, "graded": True, "can_disable": False,
-                          "note": "Measured: this model always reasons. Effort scales the "
-                                  "budget but cannot switch it off. A higher effort needs "
-                                  "a higher max_tokens or the reply can come back empty."},
+    # This model DOES reason - reasoning_content comes back populated and usage reports
+    # reasoning_tokens - but the effort is NOT controllable: LiteLLM's Baseten config
+    # does not list reasoning_effort among its supported params, so sending it raises
+    #   UnsupportedParamsError: baseten does not support parameters: ['reasoning_effort']
+    #
+    # An earlier version of this entry claimed effort was graded, based on token counts
+    # that appeared to scale. That measurement was wrong: the test script had
+    # litellm.drop_params = True, which silently DISCARDED the parameter, so every
+    # "level" was the same request and the differences were sampling noise. Verified
+    # since with drop_params=False, which raises instead.
+    "deepseek-v4-flash": {"thinks": True, "graded": False, "can_disable": False,
+                          "controllable": False,
+                          "note": "This model always reasons and the amount cannot be "
+                                  "controlled: the provider rejects reasoning_effort."},
 }
 
 
@@ -212,6 +219,7 @@ def detect_reasoning_support(model_id: str, api_base: str | None = None) -> dict
         caps = ollama_model_capabilities(tag, api_base)
         if not caps:
             return {"thinks": False, "graded": False, "can_disable": False,
+                    "controllable": False,
                     "verified": False, "detected_by": "ollama (unreachable)",
                     "note": f"Could not reach Ollama to ask what {tag} supports."}
         thinks = "thinking" in caps
@@ -220,6 +228,7 @@ def detect_reasoning_support(model_id: str, api_base: str | None = None) -> dict
             # LiteLLM maps reasoning_effort onto Ollama's boolean `think` flag.
             "graded": False,
             "can_disable": thinks,
+            "controllable": thinks,
             "verified": True,
             "detected_by": "ollama /api/show",
             "note": ("Ollama exposes thinking as on or off, with no gradation."
@@ -235,26 +244,33 @@ def detect_reasoning_support(model_id: str, api_base: str | None = None) -> dict
     try:
         import litellm
         thinks = bool(litellm.supports_reasoning(model=model_id))
-        graded = False
-        if thinks:
-            try:
-                params = litellm.get_supported_openai_params(model=model_id) or []
-                graded = "reasoning_effort" in params
-            except Exception:  # noqa: BLE001
-                graded = False
+        # Reasoning and CONTROLLING it are separate questions. A provider that rejects
+        # reasoning_effort raises UnsupportedParamsError on every request, so sending it
+        # would break the chat rather than tune it.
+        controllable = False
+        try:
+            params = litellm.get_supported_openai_params(model=model_id) or []
+            controllable = "reasoning_effort" in params
+        except Exception:  # noqa: BLE001
+            controllable = False
         return {
             "thinks": thinks,
-            "graded": graded,
-            "can_disable": graded,
+            "graded": controllable,
+            "can_disable": controllable,
+            "controllable": controllable,
             "verified": False,
             "detected_by": "litellm.supports_reasoning",
-            "note": ("" if thinks else
-                     f"{model_id} is not a reasoning model, so there is no thinking to "
-                     "control."),
+            "note": ("" if not thinks else
+                     "" if controllable else
+                     "This model reasons, but the provider does not accept "
+                     "reasoning_effort, so the amount cannot be controlled.")
+            or (f"{model_id} is not a reasoning model, so there is no thinking to "
+                "control." if not thinks else ""),
         }
     except Exception as exc:  # noqa: BLE001
         log.warning("could not detect reasoning support for %s: %s", model_id, exc)
         return {"thinks": False, "graded": False, "can_disable": False,
+                "controllable": False,
                 "verified": False, "detected_by": "unavailable",
                 "note": "Could not determine whether this model reasons."}
 

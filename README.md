@@ -199,10 +199,18 @@ Values: `none | minimal | low | medium | high`; empty leaves the provider defaul
 
 **It behaves differently per provider, so measure rather than assume:**
 
-| Provider | `none` | `low`/`medium`/`high` |
-|---|---|---|
-| Ollama | **Turns thinking off.** LiteLLM maps it to Ollama's boolean `think` flag | All mean "on" - no gradation |
-| Baseten (DeepSeek V4 Flash) | Does **not** stop it reasoning | Scales the budget: low ~1283 reasoning tokens, high ~1498 |
+| Model | Control offered |
+|---|---|
+| `ollama_chat/<tool-capable model>` | Off / On - LiteLLM maps effort to Ollama's boolean `think` flag, so there is no gradation |
+| `openai/o3`, `anthropic/claude-sonnet-4-5` | The full scale |
+| `openai/gpt-4o`, `groq/llama-3.3-70b` | **None** - not reasoning models |
+| `baseten/…DeepSeek-V4-Flash` | **None** - it reasons, but the provider rejects `reasoning_effort` entirely |
+
+Two separate questions decide this: does the model reason (`litellm.supports_reasoning`, or
+Ollama's own capabilities list), and does the provider accept the parameter
+(`get_supported_openai_params`). A model that reasons but rejects the parameter gets no
+control, because sending it raises `UnsupportedParamsError` and fails **every** request rather
+than tuning anything. The agent refuses to send it in that case and logs why.
 
 Measured on `gemma4:e4b`, same P&L question through the full agent:
 
@@ -213,6 +221,10 @@ LITELLM_REASONING_EFFORT=none       6.7s      0 thinking characters
 
 Turning thinking off made it **2.3x faster** with no loss on this kind of question. It is the
 single most effective latency setting for a local model.
+
+Beware when measuring this yourself: `litellm.drop_params = True` silently **discards**
+`reasoning_effort`, so every level becomes the same request and the differences you see are
+noise. Measure with `drop_params=False`, which raises on a provider that does not support it.
 
 ### The reasoning-model trap
 

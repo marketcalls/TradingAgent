@@ -229,7 +229,10 @@ class Settings:
                                          self.resolve_model_api_base())
         current = self.resolve_reasoning_effort() or ""
 
-        if not found["thinks"]:
+        # Two separate questions: does it reason, and can the amount be controlled?
+        # A model that reasons but rejects reasoning_effort gets no control, because
+        # sending the parameter would fail the request instead of tuning it.
+        if not found["thinks"] or not found.get("controllable", found["graded"]):
             options: list[str] = []          # the UI hides the control entirely
         elif found["graded"]:
             options = ["none", "minimal", "low", "medium", "high"]
@@ -247,6 +250,7 @@ class Settings:
                        else "On", "medium": "Medium", "high": "High"},
             "can_disable": found["can_disable"],
             "graded": found["graded"],
+            "controllable": bool(found.get("controllable", found["graded"])),
             "verified": found["verified"],
             "detected_by": found["detected_by"],
             "current": current,
