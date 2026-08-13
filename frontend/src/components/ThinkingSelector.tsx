@@ -7,6 +7,11 @@
  * The shape of the control follows the model too. Ollama exposes thinking as a boolean,
  * so it gets Off/On. A model with graded effort gets the full scale. A model that
  * reasons but cannot be silenced (DeepSeek V4 Flash, measured) simply has no Off.
+ *
+ * Colours use the project's own tokens. An earlier version used text-fg, border-subtle
+ * and bg-accent, none of which exist here, so Tailwind dropped them and the control was
+ * invisible in both themes. The text token is muted-foreground; muted on its own is a
+ * 4%-alpha BACKGROUND colour and is unreadable as text.
  */
 
 import type { ReasoningInfo } from "../lib/api"
@@ -27,7 +32,6 @@ export default function ThinkingSelector({
   // Nothing to control: not a reasoning model.
   if (!reasoning || !reasoning.modelThinks || reasoning.supported.length === 0) return null
 
-  const options = reasoning.supported
   const title = [
     reasoning.note,
     reasoning.detectedBy ? `Detected via ${reasoning.detectedBy}.` : "",
@@ -37,10 +41,10 @@ export default function ThinkingSelector({
     .join(" ")
 
   return (
-    <div className="flex items-center gap-1.5" title={title}>
-      <span className="text-xs text-muted">Thinking</span>
-      <div className="flex overflow-hidden rounded-lg border border-subtle">
-        {options.map((option) => {
+    <div className="flex shrink-0 items-center gap-2" title={title}>
+      <span className="text-xs font-medium text-muted-foreground">Thinking</span>
+      <div className="flex overflow-hidden rounded-lg border border-border">
+        {reasoning.supported.map((option) => {
           const active = value === option
           return (
             <button
@@ -50,9 +54,11 @@ export default function ThinkingSelector({
               onClick={() => onChange(option)}
               aria-pressed={active}
               className={[
-                "px-2 py-0.5 text-xs transition-colors",
-                active ? "bg-accent text-white" : "text-muted hover:text-fg",
-                disabled ? "cursor-not-allowed opacity-50" : "",
+                "px-2.5 py-1 text-xs transition-colors",
+                active
+                  ? "bg-primary font-medium text-primary-foreground"
+                  : "text-muted-foreground hover:bg-muted hover:text-foreground",
+                disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer",
               ].join(" ")}
             >
               {reasoning.labels[option] ?? option}

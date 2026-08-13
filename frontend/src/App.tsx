@@ -54,6 +54,11 @@ function readTheme(): Theme {
   return document.documentElement.classList.contains("dark") ? "dark" : "light"
 }
 
+/** localStorage key for the thinking preference of one specific model. */
+function thinkingKey(model: string): string {
+  return `oa-thinking:${model}`
+}
+
 export default function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [sessions, setSessions] = useState<SessionRow[]>([])
@@ -61,11 +66,11 @@ export default function App() {
   const [running, setRunning] = useState(false)
   const [mode, setMode] = useState<TradingMode>("unknown")
   const [reasoning, setReasoning] = useState<ReasoningInfo | null>(null)
-  // Thinking defaults to off. The server's own default is adopted only when the model
-  // cannot be silenced, so the stored preference never asks for something impossible.
-  const [effort, setEffort] = useState<string>(
-    () => localStorage.getItem("oa-thinking") ?? "none"
-  )
+  // The thinking preference is remembered PER MODEL. A choice made for one model says
+  // nothing about another - "Off" is meaningful on Ollama and impossible on DeepSeek -
+  // and a single shared key made one model's pick leak into every other model as a
+  // sticky default that overrode the configured one.
+  const [effort, setEffort] = useState<string>("")
   const [model, setModel] = useState<string | null>(null)
   const [health, setHealth] = useState<string | null>(null)
   const [theme, setTheme] = useState<Theme>(readTheme)
@@ -143,19 +148,27 @@ export default function App() {
   const onMode = useCallback((info: ModeInfo) => {
     setMode(info.mode)
     setReasoning(info.reasoning)
-    // A stored preference can be impossible for the current model, for instance "none"
-    // on a model that always reasons. Fall back to the server default in that case.
+    if (info.model) setModel(info.model)
+
     const supported = info.reasoning?.supported ?? []
-    if (supported.length > 0) {
-      setEffort((current) =>
-        supported.includes(current) ? current : info.reasoning?.current || supported[0]
-      )
-    }
+    if (supported.length === 0) return
+
+    // Resolution order: this model's remembered choice, then the server's configured
+    // default, then the lowest level offered. Anything not on offer is discarded, so
+    // the control never shows nothing selected and never asks for the impossible.
+    setEffort((current) => {
+      if (current && supported.includes(current)) return current
+      const remembered = info.model ? localStorage.getItem(thinkingKey(info.model)) : null
+      if (remembered && supported.includes(remembered)) return remembered
+      const serverDefault = info.reasoning?.current ?? ""
+      return supported.includes(serverDefault) ? serverDefault : supported[0]
+    })
   }, [])
 
+  // Persist against the model it was chosen for, not globally.
   useEffect(() => {
-    localStorage.setItem("oa-thinking", effort)
-  }, [effort])
+    if (effort && model) localStorage.setItem(thinkingKey(model), effort)
+  }, [effort, model])
 
   // Only claim the model is thinking when it can AND the user has not switched it off.
   const thinkingActive = Boolean(reasoning?.modelThinks) && effort !== "none"
