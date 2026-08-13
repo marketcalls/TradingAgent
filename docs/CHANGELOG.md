@@ -120,4 +120,11 @@ automatically. Full detail in `docs/model-notes.md`.
 ## Requirements
 
 Python 3.14, Node 18+, and a running OpenAlgo instance with a broker session.
-Pinned: `agno` 2.8.7, `litellm` 1.79.1, `openalgo` 2.0.3.
+Pinned: `agno` 2.8.7, `litellm` 1.96.2, `openalgo` 2.0.3. Everything else tracks current
+releases: FastAPI 0.141, Uvicorn 0.52, pandas 3.0, numpy 2.5, SQLAlchemy 2.0.52, Pydantic 2.13.
+
+Note on litellm 1.96.2: it **fixes** the Ollama `tool_calls` bug this project worked around,
+verified by running the round trip with the patch disabled. The workaround is kept because it is
+a no-op once upstream sends the field, and it keeps the agent working on older pins. The sibling
+fix that registers Ollama tool capability is still required - 1.96.2 still reports
+`supports_function_calling=False` for `gemma4:e4b`.

@@ -1,11 +1,16 @@
+# The three the agent's behaviour actually depends on are pinned exactly: an upgrade to
+# any of them can move the confirmation gate, the provider workarounds, or the indicator
+# surface, none of which should change without re-running the suites.
 agno==2.8.7
-litellm==1.79.1
+litellm==1.96.2
 openalgo==2.0.3
-fastapi>=0.115
-uvicorn[standard]>=0.32
-httpx>=0.28
-pandas>=2.2
-numpy>=1.26
-sqlalchemy>=2.0
-python-dotenv>=1.0
-pydantic>=2.9
+
+# Everything else tracks the current release.
+fastapi>=0.141.1
+uvicorn[standard]>=0.52.2
+httpx>=0.28.1
+pandas>=3.0.5
+numpy>=2.5.2
+sqlalchemy>=2.0.52
+python-dotenv>=1.2.2
+pydantic>=2.13.4

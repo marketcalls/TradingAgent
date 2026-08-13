@@ -129,6 +129,15 @@ def patch_ollama_tool_call_roundtrip() -> bool:
 
     This copies the already-converted tool_calls onto the outgoing message. It is
     idempotent and a no-op if LiteLLM fixes the bug and starts sending them itself.
+
+    STATUS: fixed upstream in litellm 1.96.2, which this project now pins. Verified by
+    running the same round trip with the patch disabled: the follow-up turn answered
+    "Your available cash is 9,999,977.02" and called nothing. The patch is kept because
+    it costs nothing - it skips any message that already carries tool_calls - and it
+    keeps the agent working for anyone pinned to an older litellm.
+
+    Note the sibling fix, register_ollama_tool_support, is still REQUIRED: on 1.96.2
+    litellm still reports supports_function_calling=False for gemma4:e4b.
     """
     try:
         from litellm.llms.ollama.chat.transformation import OllamaChatConfig

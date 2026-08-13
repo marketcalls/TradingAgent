@@ -168,13 +168,19 @@ refused even while the server is up.
 | Piece | Version | What it does |
 |---|---|---|
 | [Agno](https://docs.agno.com) | 2.8.7 | Agent loop, tool calling, the approval gate, session storage |
-| [LiteLLM](https://docs.litellm.ai) | 1.79.1 | Model routing to any provider |
+| [LiteLLM](https://docs.litellm.ai) | 1.96.2 | Model routing to any provider |
 | [OpenAlgo SDK](https://docs.openalgo.in) | 2.0.3 | Broker connection, REST on `127.0.0.1:5000` |
-| FastAPI + Uvicorn | 0.115+ / 0.32+ | HTTP API and SSE streaming |
+| FastAPI | 0.141+ | HTTP API and SSE streaming |
+| Uvicorn | 0.52+ | ASGI server |
 | OpenAlgo `ta` | bundled | 127 indicators, Rust-backed |
-| pandas / numpy | 2.2+ / 1.26+ | Candle handling for indicators |
+| pandas / numpy | 3.0+ / 2.5+ | Candle handling for indicators |
+| SQLAlchemy / Pydantic | 2.0+ / 2.13+ | Agno storage, request models |
 | SQLite | stdlib | Sessions, paused orders awaiting approval, audit trail |
 | Python | 3.14 | |
+
+Agno, LiteLLM and the OpenAlgo SDK are pinned exactly, because an upgrade to any of them can move
+the approval gate, the provider workarounds, or the indicator surface. The rest track current
+releases.
 
 ### Frontend
 
