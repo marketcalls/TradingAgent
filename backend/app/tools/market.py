@@ -25,6 +25,31 @@ from ..openalgo.normalize import err, frame_summary, ok, to_json
 log = logging.getLogger(__name__)
 
 
+def _rank_matches(query: str, rows: list) -> list:
+    """Put the exact symbol first.
+
+    OpenAlgo's search returns matches in its own order, which buries an exact hit:
+    "NIFTY" on NSE_INDEX returns 130 rows and "NIFTY 50" returns 45 led by NIFTY500 and
+    NIFTYNXT50. A model reading the top of that list picks the wrong instrument, so the
+    obvious candidate is promoted here.
+    """
+    q = (query or "").strip().upper()
+    q_tight = q.replace(" ", "")
+
+    def score(row: dict) -> tuple:
+        sym = str(row.get("symbol", "")).upper()
+        return (
+            0 if sym == q or sym == q_tight else
+            1 if sym.replace(" ", "") == q_tight else
+            2 if sym.startswith(q_tight) else
+            3 if q_tight in sym else 4,
+            len(sym),
+        )
+
+    return sorted((r for r in rows if isinstance(r, dict)), key=score)
+
+
+
 class MarketDataTools(Toolkit):
     def __init__(self, client: OpenAlgoClient | None = None,
                  frames: FrameCache | None = None, **kwargs: Any) -> None:
@@ -56,14 +81,70 @@ class MarketDataTools(Toolkit):
             str: JSON with ltp, open, high, low, prev_close, bid, ask and volume.
         """
         sym, ex = C.normalize_symbol(symbol), C.normalize_exchange(exchange)
+
+        # "NIFTY 50" is what people say; "NIFTY" is what OpenAlgo calls it. Fix the
+        # spoken forms before spending a request, and correct the exchange too, since
+        # an index on the wrong exchange fails the same way.
+        alias = C.resolve_index_alias(sym)
+        corrected = None
+        if alias:
+            corrected = f"{sym} on {ex or '(none)'} is not an OpenAlgo symbol; used {alias}"
+            sym = alias
+        if sym in C.INDEX_EXCHANGE and ex != C.INDEX_EXCHANGE[sym]:
+            right = C.INDEX_EXCHANGE[sym]
+            corrected = f"{corrected + '; ' if corrected else ''}{sym} quotes on {right}"
+            ex = right
+
         res = self.client.call_enveloped("quotes", symbol=sym, exchange=ex)
         if not res["ok"]:
-            raise RetryAgentRun(
-                f"Quote failed for {sym} on {ex}: {res['error']}. "
-                "Check the exchange (equities are NSE or BSE, derivatives NFO or BFO, "
-                "indices NSE_INDEX) or call search_symbols to find the exact symbol."
+            raise RetryAgentRun(self._quote_failure_hint(sym, ex, res["error"]))
+
+        out = {**res, "symbol": sym, "exchange": ex}
+        if corrected:
+            out["corrected"] = corrected
+        return to_json(out)
+
+    def _quote_failure_hint(self, sym: str, ex: str, error: str) -> str:
+        """Turn a failed lookup into something the model can act on.
+
+        A bare "not found" leaves the model guessing, and search ranking does not
+        rescue a near-miss: searching "NIFTY 50" returns NIFTY500 and NIFTYNXT50 while
+        the right answer, NIFTY, does not surface. So the candidates are fetched here
+        and put in front of the model rather than left for it to find.
+        """
+        parts = [f"Quote failed for {sym} on {ex}: {error}"]
+        found_candidates = False
+        try:
+            res = self.client.call_enveloped("search", query=sym, exchange=ex or None)
+            rows = res.get("data") if res.get("ok") else None
+            if isinstance(rows, list) and rows:
+                ranked = _rank_matches(sym, rows)[:6]
+                if ranked:
+                    found_candidates = True
+                    parts.append(
+                        "Closest matching symbols: "
+                        + ", ".join(f"{r.get('symbol')} ({r.get('exchange')})" for r in ranked)
+                        + ". Use one of these exactly."
+                    )
+        except Exception:  # noqa: BLE001
+            log.debug("candidate lookup failed", exc_info=True)
+
+        if not found_candidates:
+            # Nothing resembling it exists. Say what to do next rather than leaving the
+            # model with a bare failure, which is what made it abandon the question.
+            parts.append(
+                f"Nothing similar exists on {ex}. Call search_symbols with the company "
+                "or underlying name to find the real symbol, and check the exchange: "
+                "equities are NSE or BSE, derivatives NFO or BFO, commodities MCX, "
+                "indices NSE_INDEX or BSE_INDEX."
             )
-        return to_json({**res, "symbol": sym, "exchange": ex})
+        if C.is_index_exchange(ex) or "INDEX" in ex:
+            parts.append(
+                "Index symbols in OpenAlgo carry no spaces and no '50': the common ones "
+                "are NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50 and INDIAVIX on "
+                "NSE_INDEX, and SENSEX and BANKEX on BSE_INDEX."
+            )
+        return " ".join(parts)
 
     def get_quotes_bulk(self, symbols: list[dict]) -> str:
         """Get price snapshots for several instruments in one round trip.

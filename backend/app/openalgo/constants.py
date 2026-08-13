@@ -44,6 +44,53 @@ KNOWN_INTERVALS: tuple[str, ...] = (
 
 _OFFSET_RE = re.compile(r"^(ATM|ITM([1-9]|[1-4][0-9]|50)|OTM([1-9]|[1-4][0-9]|50))$")
 
+# The index names people actually say, mapped to OpenAlgo's symbol.
+#
+# This exists because search does NOT rescue a near-miss: searching "NIFTY 50" on
+# NSE_INDEX returns 45 rows led by NIFTY500, NIFTYNXT50 and NIFTY50 USD, while the
+# correct answer, plain NIFTY, is nowhere near the top. A model that guesses "NIFTY 50"
+# therefore fails the quote AND fails the search, and gives up.
+INDEX_ALIASES: dict[str, str] = {
+    # NSE
+    "NIFTY 50": "NIFTY", "NIFTY50": "NIFTY", "NIFTY-50": "NIFTY", "NSE NIFTY": "NIFTY",
+    "NIFTY INDEX": "NIFTY", "S&P CNX NIFTY": "NIFTY", "CNX NIFTY": "NIFTY",
+    "BANK NIFTY": "BANKNIFTY", "NIFTY BANK": "BANKNIFTY", "NIFTYBANK": "BANKNIFTY",
+    "FIN NIFTY": "FINNIFTY", "NIFTY FIN SERVICE": "FINNIFTY",
+    "NIFTY FINANCIAL SERVICES": "FINNIFTY",
+    "MIDCAP NIFTY": "MIDCPNIFTY", "NIFTY MIDCAP SELECT": "MIDCPNIFTY",
+    "MIDCPNIFTY50": "MIDCPNIFTY",
+    "NIFTY NEXT 50": "NIFTYNXT50", "NIFTY NEXT50": "NIFTYNXT50", "NEXT 50": "NIFTYNXT50",
+    "INDIA VIX": "INDIAVIX", "VIX": "INDIAVIX",
+    "NIFTY IT": "NIFTYIT", "NIFTY AUTO": "NIFTYAUTO", "NIFTY PHARMA": "NIFTYPHARMA",
+    "NIFTY FMCG": "NIFTYFMCG", "NIFTY METAL": "NIFTYMETAL", "NIFTY ENERGY": "NIFTYENERGY",
+    "NIFTY REALTY": "NIFTYREALTY", "NIFTY PSU BANK": "NIFTYPSUBANK",
+    "NIFTY PVT BANK": "NIFTYPVTBANK", "NIFTY INFRA": "NIFTYINFRA",
+    # BSE
+    "BSE SENSEX": "SENSEX", "S&P BSE SENSEX": "SENSEX", "SENSEX 30": "SENSEX",
+    "BSE BANKEX": "BANKEX", "SENSEX 50": "SENSEX50",
+}
+
+# Which exchange each canonical index actually quotes on, so a wrong exchange is
+# correctable too.
+INDEX_EXCHANGE: dict[str, str] = {
+    **{s: "NSE_INDEX" for s in (
+        "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50", "INDIAVIX",
+        "NIFTYIT", "NIFTYAUTO", "NIFTYPHARMA", "NIFTYFMCG", "NIFTYMETAL",
+        "NIFTYENERGY", "NIFTYREALTY", "NIFTYPSUBANK", "NIFTYPVTBANK", "NIFTYINFRA")},
+    **{s: "BSE_INDEX" for s in ("SENSEX", "BANKEX", "SENSEX50")},
+}
+
+
+def resolve_index_alias(symbol: str) -> str | None:
+    """Map a spoken index name onto its OpenAlgo symbol, or None if it is not an alias."""
+    raw = (symbol or "").strip().upper()
+    if not raw:
+        return None
+    if raw in INDEX_EXCHANGE:          # already canonical
+        return None
+    squashed = " ".join(raw.split())
+    return INDEX_ALIASES.get(squashed) or INDEX_ALIASES.get(squashed.replace(" ", ""))
+
 
 def is_valid_offset(offset: str) -> bool:
     """ATM, ITM1..ITM50, OTM1..OTM50."""

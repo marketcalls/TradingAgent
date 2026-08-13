@@ -217,8 +217,12 @@ def test_live(kits: list) -> None:
         call(market, "get_quote", symbol="NOSUCHSYM999", exchange="NSE")
         check("bad symbol raises RetryAgentRun", False, "no exception")
     except RetryAgentRun as exc:
-        check("bad symbol raises RetryAgentRun",
-              "search_symbols" in str(exc), str(exc)[:70])
+        # The message must be ACTIONABLE, not merely an error. It now carries the
+        # closest real symbols rather than telling the model to go and search.
+        msg = str(exc)
+        check("bad symbol raises an actionable RetryAgentRun",
+              "Closest matching symbols" in msg or "search_symbols" in msg
+              or "Index symbols" in msg, msg[:90])
     except Exception as exc:  # noqa: BLE001
         check("bad symbol raises RetryAgentRun", False, f"wrong type {type(exc).__name__}")
 

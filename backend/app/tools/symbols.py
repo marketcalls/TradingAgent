@@ -21,6 +21,17 @@ from ..openalgo.normalize import err, ok, to_json
 log = logging.getLogger(__name__)
 
 MAX_INSTRUMENT_ROWS = 60
+# Search results are for identifying an instrument, so only the fields that help do that
+# are returned. The raw rows carry token, brsymbol, brexchange, freeze_qty and tick_size
+# as well, which pushed a 60-row reply past the 12,000-character tool budget and got the
+# whole thing truncated.
+SEARCH_ROWS = 25
+SEARCH_FIELDS = ("symbol", "name", "exchange", "instrumenttype", "expiry", "strike",
+                 "lotsize")
+
+
+def _slim(row: dict) -> dict:
+    return {k: row[k] for k in SEARCH_FIELDS if k in row and row[k] not in ("", None)}
 
 
 class SymbolTools(Toolkit):
@@ -56,6 +67,15 @@ class SymbolTools(Toolkit):
         q = (query or "").strip()
         if not q:
             raise RetryAgentRun("search_symbols needs a non-empty query.")
+
+        # Searching the spoken name does not find the instrument: "NIFTY 50" returns
+        # NIFTY500 and NIFTYNXT50, never plain NIFTY. Resolve the alias first.
+        alias = C.resolve_index_alias(q)
+        note = None
+        if alias:
+            note = f"{q!r} is not an OpenAlgo symbol; searched {alias} instead"
+            q = alias
+
         kwargs: dict[str, Any] = {"query": q}
         ex = C.normalize_exchange(exchange)
         if ex:
@@ -64,9 +84,17 @@ class SymbolTools(Toolkit):
         if not res["ok"]:
             raise RetryAgentRun(f"Symbol search failed for {q!r}: {res['error']}")
         data = res.get("data")
-        if isinstance(data, list) and len(data) > MAX_INSTRUMENT_ROWS:
-            res["data"] = data[:MAX_INSTRUMENT_ROWS]
-            res["truncated"] = f"showing {MAX_INSTRUMENT_ROWS} of {len(data)} matches"
+        if isinstance(data, list) and data:
+            # Rank before truncating, or an exact match can be cut off entirely: the
+            # raw order for "NIFTY 50" leads with NIFTY500 and NIFTYNXT50.
+            from .market import _rank_matches
+            ranked = _rank_matches(q, data)
+            res["data"] = [_slim(r) for r in ranked[:SEARCH_ROWS]]
+            if len(ranked) > SEARCH_ROWS:
+                res["truncated"] = (f"showing the {SEARCH_ROWS} closest of "
+                                    f"{len(ranked)} matches, best first")
+        if note:
+            res["corrected"] = note
         return to_json(res)
 
     def get_symbol_info(self, symbol: str, exchange: str) -> str:

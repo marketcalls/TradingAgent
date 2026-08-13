@@ -62,6 +62,18 @@ INSTRUCTIONS = [
     "search_symbols rather than constructing one.",
     "Indices live on NSE_INDEX, BSE_INDEX, MCX_INDEX and GLOBAL_INDEX and are quote-only. "
     "They cannot be traded. To trade an index view, use its future or option.",
+    "Index symbols carry NO spaces and no '50' suffix. The ones you will need: on "
+    "NSE_INDEX use NIFTY (not 'NIFTY 50'), BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50 "
+    "and INDIAVIX; on BSE_INDEX use SENSEX and BANKEX. Sector indices follow the same "
+    "pattern, for example NIFTYIT and NIFTYPHARMA.",
+    "If a quote or lookup fails, read the error: it lists the closest real symbols. Use "
+    "one of them rather than guessing another spelling, and never give up on a question "
+    "because one symbol lookup failed.",
+    "For an OPTION contract never use search_symbols and never build the symbol by hand. "
+    "Call resolve_option_symbol with the underlying, expiry and an offset such as ATM, "
+    "ITM2 or OTM3, which returns the exact symbol with its lot size. For a straddle "
+    "resolve the ATM call and the ATM put. To see many strikes at once call "
+    "get_option_chain, which also returns Greeks.",
 
     # constants
     "Valid exchanges: NSE, BSE, NFO, BFO, CDS, BCD, MCX, NCDEX, NCO. Products: MIS "
@@ -126,16 +138,37 @@ LEAN_READ_ONLY: dict[str, list[str]] = {
 }
 LEAN_ORDERS: list[str] = ["place_order", "modify_order", "cancel_order", "get_order_status"]
 
+# OptionsTools mixes read-only analytics with two order tools. The analytics half must be
+# available WITHOUT trading enabled: without resolve_option_symbol the agent cannot name
+# an option contract at all, and was reduced to guessing from search results.
+OPTIONS_READ_ONLY: list[str] = ["resolve_option_symbol", "get_option_chain",
+                                "get_option_greeks", "get_synthetic_future"]
+OPTIONS_ORDERS: list[str] = ["place_options_order", "place_options_multi_order"]
+
+
+def _options_read_toolkit(client=None):
+    """The analytics half of OptionsTools, safe without trading enabled."""
+    try:
+        from .tools.options import OptionsTools
+        return OptionsTools(client=client, include_tools=OPTIONS_READ_ONLY)
+    except ImportError:
+        log.warning("options tools unavailable")
+        return None
+
 
 def _read_only_toolkits(client=None, frames=None, lean: bool = False) -> list:
     if not lean:
-        return [
+        kits = [
             MarketDataTools(client=client, frames=frames),
             SymbolTools(client=client),
             AccountTools(client=client),
             IndicatorTools(client=client, frames=frames),
             SystemTools(client=client),
         ]
+        options = _options_read_toolkit(client)
+        if options is not None:
+            kits.append(options)
+        return kits
     return [
         MarketDataTools(client=client, frames=frames,
                         include_tools=LEAN_READ_ONLY["market"]),
@@ -169,7 +202,8 @@ def _order_toolkits(client=None, lean: bool = False) -> list:
         log.warning("gtt tools unavailable")
     try:
         from .tools.options import OptionsTools
-        kits.append(OptionsTools(client=client))
+        # Only the order half here; the analytics half is already in the read-only set.
+        kits.append(OptionsTools(client=client, include_tools=OPTIONS_ORDERS))
     except ImportError:
         log.warning("options tools unavailable")
     return kits
