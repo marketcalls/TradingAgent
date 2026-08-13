@@ -64,6 +64,15 @@ broker.
 - Analyzer (simulated) mode is the default and live mode is refused while
   `REQUIRE_ANALYZER_MODE` is set.
 
+### Frontend stack
+
+Built on the current generation: React 19.2, TypeScript 7.0 (the native compiler), Vite 8.2 and
+Tailwind CSS 4.3. Tailwind 4 is CSS-first, so `tailwind.config.js` and the PostCSS step are gone:
+the theme lives in an `@theme` block in `src/index.css`, and `@tailwindcss/vite` replaces
+`postcss` and `autoprefixer`. Two v4 behaviour changes are handled explicitly - the dark variant
+is redefined to follow the app's class toggle rather than `prefers-color-scheme`, and the default
+border colour is pinned to the project token instead of v4's `currentColor`.
+
 ### Interface
 
 - Streaming chat over SSE with a live tool timeline.

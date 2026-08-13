@@ -163,15 +163,34 @@ refused even while the server is up.
 
 ## The stack
 
-| Layer | What |
-|---|---|
-| AI framework | [Agno](https://docs.agno.com) 2.8.7 - agent loop, tool calling, the approval gate, session storage |
-| Model routing | [LiteLLM](https://docs.litellm.ai) 1.79.1 - any provider: Baseten, OpenAI, Anthropic, Gemini, Groq, OpenRouter, or local via Ollama |
-| Broker | [OpenAlgo](https://docs.openalgo.in) 2.0.3 Python SDK, REST on `127.0.0.1:5000` |
-| Backend | FastAPI + Uvicorn, streaming over SSE, Python 3.14 |
-| Indicators | OpenAlgo's Rust-backed `ta` library, 127 functions, with pandas and numpy |
-| Storage | SQLite - chat sessions, paused orders awaiting approval, and the audit trail |
-| Frontend | React 18.3, TypeScript 5.6, Vite 5.4, Tailwind 3.4, react-markdown with GFM tables |
+### Backend
+
+| Piece | Version | What it does |
+|---|---|---|
+| [Agno](https://docs.agno.com) | 2.8.7 | Agent loop, tool calling, the approval gate, session storage |
+| [LiteLLM](https://docs.litellm.ai) | 1.79.1 | Model routing to any provider |
+| [OpenAlgo SDK](https://docs.openalgo.in) | 2.0.3 | Broker connection, REST on `127.0.0.1:5000` |
+| FastAPI + Uvicorn | 0.115+ / 0.32+ | HTTP API and SSE streaming |
+| OpenAlgo `ta` | bundled | 127 indicators, Rust-backed |
+| pandas / numpy | 2.2+ / 1.26+ | Candle handling for indicators |
+| SQLite | stdlib | Sessions, paused orders awaiting approval, audit trail |
+| Python | 3.14 | |
+
+### Frontend
+
+| Piece | Version | Notes |
+|---|---|---|
+| React | 19.2 | |
+| TypeScript | 7.0 | The native compiler |
+| Vite | 8.2 | |
+| Tailwind CSS | 4.3 | CSS-first: the theme lives in `@theme` in `src/index.css`, and there is no `tailwind.config.js` or PostCSS step |
+| react-markdown + remark-gfm | 10.1 / 4.0 | GFM tables, which most answers use |
+| lucide-react | 1.31 | Icons for UI chrome |
+
+### Models
+
+Any LiteLLM provider: Baseten, OpenAI, Anthropic, Gemini, Groq, OpenRouter, or a local model
+through Ollama with no API key. See [docs/model-notes.md](docs/model-notes.md).
 
 **43 tools** across 8 toolkits, covering 43 of OpenAlgo's endpoints. 13 of them can move money,
 and all 13 require your approval.
