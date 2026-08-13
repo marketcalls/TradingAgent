@@ -1,16 +1,17 @@
 # OpenAlgo Trading Agent
 
-A chat-first trading agent for Indian markets. Ask it for quotes, positions, option chains or
-any of 127 technical indicators, and instruct it to place orders. Every order stops and asks for
-your approval before anything reaches the broker.
+Trade Indian markets by typing what you want. Ask for a quote, an option chain, an indicator or
+a screen, and tell it to place the order.
+
+**Every order stops and asks you to approve it before anything reaches your broker.**
 
 Built on [Agno](https://docs.agno.com) with [OpenAlgo](https://docs.openalgo.in) as the broker
-gateway, a FastAPI + SSE backend, and a React frontend.
+connection.
 
 ```
 You:   Buy 5 shares of TATAMOTORS on NSE at market, CNC.
 
-Agent: [confirmation card]
+Agent: [approval card]
        Simulated order (analyze mode)                         place_order
        Symbol TMCV | Action BUY | Exchange NSE | Quantity 5 | Product CNC
 
@@ -21,280 +22,217 @@ Agent: [confirmation card]
        [Approve]  [Reject]
 ```
 
-Nothing is sent until you click Approve.
+Nothing is sent until you click Approve. The numbers under "Checked by the server" are fetched by
+the backend, not written by the AI, so they are worth trusting even if the reply above them is
+wrong.
 
-## What it can do
+## Things you can ask it
 
-- **Market data** - quotes, bulk quotes, five-level depth, historical candles, intervals,
-  holidays and session timings.
-- **Symbols** - free-text search, contract details with lot and tick size, expiry lists, and a
-  filtered instrument master.
-- **Account** - funds, order book, trade book, positions, holdings, and pre-trade margin.
-- **Indicators** - all 127 callables from OpenAlgo's `ta` library behind five tools: list,
-  describe, compute, batch-compute, and a multi-symbol screener.
-- **Options** - option chain with Greeks, ATM/ITM/OTM symbol resolution, single and batch
-  Greeks, synthetic future, and multi-leg orders.
-- **Orders** - market, limit, SL and SL-M; smart, basket and split orders; modify and cancel;
-  cancel-all and square-off-all; GTT.
+**Prices and charts**
 
-43 tools in total. 13 of them mutate something, and all 13 are confirmation-gated.
+- What is RELIANCE trading at?
+- Show me the market depth for SBIN
+- NIFTY and BANKNIFTY quotes side by side
+- How has INFY moved over the last 10 days on the 15 minute chart?
+
+**Indicators** - all 127 from OpenAlgo's library
+
+- 14 period RSI for SBIN on the 15 minute chart
+- Show me RSI, MACD, ADX and Supertrend for RELIANCE together
+- Which of SBIN, TCS, INFY, WIPRO have RSI below 30?
+- Where is MACD crossing over on my watchlist?
+- Correlation between SBIN and NIFTY over 20 days
+
+**Options**
+
+- Current month NIFTY straddle symbols
+- NIFTY option chain for the nearest expiry with Greeks
+- What is the ATM call for BANKNIFTY this expiry?
+- Margin required for a NIFTY iron condor
+
+**Your account**
+
+- What are my funds?
+- Show my open positions and P&L
+- What did I trade today?
+- My holdings with current value
+
+**Orders** - each one asks you to approve first
+
+- Buy 10 shares of RELIANCE at market, CNC
+- Sell 50 SBIN at limit 1085, MIS
+- Buy 1 lot of NIFTY 24300 CE
+- Modify order 250408001002736 to limit 16.50
+- Cancel all open orders
+- Square off all positions
+
+It knows OpenAlgo's symbol format, so "NIFTY 50" and "BANK NIFTY" resolve to the right
+instruments, and it looks option symbols up rather than guessing them.
 
 ## Safety
 
-Four independent layers, because only the lower two actually hold:
+**Analyzer mode is the default.** OpenAlgo simulates orders until you deliberately switch it off,
+and `REQUIRE_ANALYZER_MODE=true` refuses live orders even then. You have to mean it.
 
-| Layer | Enforced by | Defeated by |
+Four independent layers, because only the lower two really hold:
+
+| Layer | What it does | What defeats it |
 |---|---|---|
-| 1. Instructions | The prompt | Any model mistake. Assume it fails. |
-| 2. Tool scoping | Tools resolved per run from session state | Nothing the model does - the schema is not there |
-| 3. Human confirmation | Agno `requires_confirmation` | A user who clicks Approve without reading |
-| 4. RiskGuard | Deterministic Python, after approval, before the broker | Only a config change |
+| 1. Instructions | Tells the AI the rules | Any AI mistake. Assume it fails |
+| 2. Tool scoping | With trading off, order tools do not exist for the AI at all | Nothing the AI does |
+| 3. Your approval | Every order pauses for a click | Approving without reading |
+| 4. RiskGuard | Deterministic checks after approval, before the broker | Only a config change |
 
-RiskGuard checks, in order: kill switch file, `TRADING_ENABLED`, analyzer mode, symbol denylist,
-exchange allowlist (index feeds are refused as untradable), product allowlist, quantity bounds,
-per-session order cap, duplicate suppression within 10 seconds, notional cap, and a fat-finger
-guard that refuses a limit price more than 20 percent from the last traded price.
+RiskGuard refuses, in order: the kill switch, `TRADING_ENABLED`, live mode, denylisted symbols,
+exchanges outside your allowlist, index symbols (which cannot be traded), products outside your
+allowlist, bad quantities, your per-session order cap, **duplicate orders within 10 seconds**,
+your notional cap, and a **fat-finger guard on any limit price more than 20 percent from the last
+traded price**.
 
-Every mutating call is written to an audit trail twice - before the broker is touched and after -
-in `data/audit/orders-YYYY-MM-DD.jsonl` and a SQLite table.
+Every order is written to an audit trail twice, before the broker is touched and after, in
+`data/audit/orders-YYYY-MM-DD.jsonl` and a SQLite table. That is the record of what happened and
+why.
 
-**Analyzer mode is the default.** OpenAlgo simulates orders until you deliberately turn it off,
-and `REQUIRE_ANALYZER_MODE=true` refuses live orders regardless.
+**Stop everything instantly**, without restarting anything:
+
+```bash
+touch data/KILL
+```
+
+Every order tool refuses while that file exists.
 
 ## Setup
 
-Requires Python 3.14, Node 18+, and a running OpenAlgo instance with a broker session.
+You need Python 3.14, Node 18+, and **OpenAlgo already running with your broker logged in**.
 
 ```bash
 git clone https://github.com/marketcalls/TradingAgent
 cd TradingAgent
 
-cp .env.example .env      # then fill in the two keys below
+cp .env.example .env
 
 pip install -r backend/requirements.txt
 cd frontend && npm install && cd ..
 ```
 
-Two keys are required in `.env`:
+Two keys go in `.env`:
 
 | Key | Where it comes from |
 |---|---|
 | `OPENALGO_API_KEY` | The OpenAlgo web app, after logging in with your broker |
-| `LITELLM_API_KEY` | Your model provider. Leave empty for a local Ollama model |
+| `LITELLM_API_KEY` | Your AI provider. Leave empty to run a local model with Ollama |
 
-Everything else has a working default. `.env` is gitignored.
+Everything else has a working default. `.env` is gitignored, so your keys stay local.
 
 ## Run
 
-Start OpenAlgo first and log in with your broker - the agent checks the connection on
-startup and every tool depends on it.
-
 ```bash
-# terminal 1 - backend on :8088
+# terminal 1 - backend
 cd backend
 python -m uvicorn app.main:app --port 8088
 
-# terminal 2 - frontend on :5173
+# terminal 2 - frontend
 cd frontend
 npm run dev
 ```
 
 Open **http://localhost:5173**.
 
-Use `localhost`, not `127.0.0.1`: Vite binds the hostname only, so
-`http://127.0.0.1:5173` is refused even while the server is up.
+Use `localhost`, not `127.0.0.1`: Vite binds the hostname only, so `http://127.0.0.1:5173` is
+refused even while the server is up.
 
-The frontend proxies `/api` to `http://127.0.0.1:8088`, so both must be running. If you
-change `BACKEND_PORT` in `.env`, change the proxy target in `frontend/vite.config.ts` to
-match.
+### Before you place anything
 
-Check the backend by itself:
+1. The banner at the top should read **ANALYZE**, meaning orders are simulated.
+2. Ask it "what are my funds?" - if that works, the broker connection is good.
+3. Order tools are **off by default**. To use them, set `TRADING_ENABLED=true` in `.env` and
+   restart the backend. Keep `REQUIRE_ANALYZER_MODE=true` until you genuinely intend to trade
+   real money.
 
-```bash
-curl http://127.0.0.1:8088/api/health
-# {"ok":true,"model":"...","openalgo_connected":true,"broker":"zerodha","trading_enabled":false}
-```
+## If something is not working
 
-`openalgo_connected: false` means OpenAlgo is not reachable or the API key is wrong;
-nothing else will work until that is true.
+| What you see | What it means |
+|---|---|
+| "I do not have an order-placement tool" | `TRADING_ENABLED=false`. Set it true and restart the backend |
+| Every answer fails | OpenAlgo is not running, or the API key is wrong. Run `curl http://127.0.0.1:8088/api/health` and look for `openalgo_connected: true` |
+| The page will not load | You used `127.0.0.1:5173`. Use `localhost:5173` |
+| A change to `.env` did nothing | The backend reads `.env` once at startup. Restart it |
+| "No order was placed" warning under a reply | The AI described an order without actually submitting it. Ask again |
+| Symbol not found | Ask it to search, for example "find the symbol for Tata Motors". Names change; `TATAMOTORS` became `TMCV` after the demerger |
+| It refuses your order | Read the reason. RiskGuard names the exact limit it hit |
 
-Restarting: the backend reads `.env` **once at startup**, so any change to the model,
-tool profile or risk limits needs a restart to take effect. The frontend hot-reloads.
+## The stack
 
-To let the agent place orders at all, set `TRADING_ENABLED=true` and restart. Keep
-`REQUIRE_ANALYZER_MODE=true` until you genuinely intend to trade real money.
+| Layer | What |
+|---|---|
+| AI framework | [Agno](https://docs.agno.com) 2.8.7 - agent loop, tool calling, the approval gate, session storage |
+| Model routing | [LiteLLM](https://docs.litellm.ai) 1.79.1 - any provider: Baseten, OpenAI, Anthropic, Gemini, Groq, OpenRouter, or local via Ollama |
+| Broker | [OpenAlgo](https://docs.openalgo.in) 2.0.3 Python SDK, REST on `127.0.0.1:5000` |
+| Backend | FastAPI + Uvicorn, streaming over SSE, Python 3.14 |
+| Indicators | OpenAlgo's Rust-backed `ta` library, 127 functions, with pandas and numpy |
+| Storage | SQLite - chat sessions, paused orders awaiting approval, and the audit trail |
+| Frontend | React 18.3, TypeScript 5.6, Vite 5.4, Tailwind 3.4, react-markdown with GFM tables |
 
-To stop everything immediately without restarting, create the kill switch file:
-
-```bash
-touch data/KILL
-```
-
-Every mutating tool refuses while it exists.
+**43 tools** across 8 toolkits, covering 43 of OpenAlgo's endpoints. 13 of them can move money,
+and all 13 require your approval.
 
 ## Validate
 
 ```bash
-python scripts/validate_setup.py            # 26 checks: broker, model, confirmation gate
-python backend/tests/test_client_layer.py   # 44
-python backend/tests/test_safety.py         # 48
-python backend/tests/test_registry.py       # 21
-python backend/tests/test_tools_readonly.py # 32
-python backend/tests/test_indicators.py     # 64
-python backend/tests/test_tools_orders.py   # 114
-python backend/tests/test_confirm_loop.py   # 25, full HTTP round trip
+python scripts/validate_setup.py            # broker, model and approval gate
+python backend/tests/test_client_layer.py
+python backend/tests/test_safety.py         # every RiskGuard limit
+python backend/tests/test_registry.py       # all 127 indicators
+python backend/tests/test_tools_readonly.py
+python backend/tests/test_indicators.py
+python backend/tests/test_tools_orders.py
+python backend/tests/test_confirm_loop.py   # full approval round trip over HTTP
+python backend/tests/test_hitl_models.py    # the approval gate on every model
 ```
 
-374 checks. The order tests refuse to run unless OpenAlgo reports analyzer mode, so they never
-place a real order.
-
-## Model
-
-Everything goes through LiteLLM, so any provider works - cloud or local. There is **one key**
-and one optional base URL; the prefix on `LITELLM_MODEL` decides the provider.
-
-```bash
-# Baseten (default)
-LITELLM_MODEL=baseten/deepseek-ai/DeepSeek-V4-Flash-0731
-LITELLM_API_KEY=<baseten key>
-
-# OpenAI
-LITELLM_MODEL=openai/gpt-5.2
-LITELLM_API_KEY=sk-<openai key>
-
-# Local, via Ollama - no key at all
-LITELLM_MODEL=ollama_chat/llama3.1
-LITELLM_API_KEY=
-```
-
-Anthropic, Gemini, Groq, OpenRouter and LM Studio follow the same shape. `.env.example` lists
-them.
-
-### The agent needs tool calling
-
-Every answer comes from a tool, so a model that cannot call tools is useless here.
-
-**Running locally with Ollama:** use the `ollama_chat/` prefix and a tool-capable model
-(`ollama show <model>` lists `tools` under capabilities). Two LiteLLM bugs sit on that path,
-both corrected automatically in `backend/app/model_providers.py`:
-
-1. **LiteLLM's model table is stale.** It reports `supports_function_calling=False` for most
-   Ollama tags and falls back to a JSON-emulation path that either crashes on the turn after a
-   tool result or returns an empty reply. The agent asks Ollama for the model's real
-   capabilities and registers the truth.
-
-2. **LiteLLM drops `tool_calls` from assistant messages.** `OllamaChatConfig.transform_request`
-   converts them, then builds the outgoing message copying only role, thinking, content and
-   images. Ollama therefore sees a tool result for a call it has no record of, so the model
-   calls the tool again - forever, with an empty final answer. The agent restores them.
-
-   The same exchange against Ollama's native `/api/chat` answered correctly and called nothing,
-   which is how this was isolated: the model was never the problem.
-
-### Tool profile
-
-`TOOL_PROFILE` is `full` (43 tools) or `lean` (15). Empty picks automatically: **lean for local
-models, full otherwise**.
-
-Small models cannot choose reliably among 43 tools. With `gemma4:e4b` (8B) on the full set, a
-simple quote request produced 16 tool calls against the wrong symbol and an answer about market
-depth; asked for funds, it claimed it had no such function while `get_funds` was in scope.
-
-On the lean profile, with both LiteLLM bugs corrected, the same model answers each of those in
-**a single tool call** with a correct markdown table. Lean also shortens the instruction set and
-caps `tool_call_limit` at 6, so a confused model stops instead of looping.
-
-Set `TOOL_PROFILE=full` to override, at the cost of reliability on a small model.
-
-### Thinking / reasoning effort
-
-`LITELLM_REASONING_EFFORT` sets the default; **the user can also change it per message from the
-header**, and the choice is remembered. Thinking is **off by default**.
-
-The control is built from what the model actually supports, detected per model rather than per
-provider - so `openai/gpt-4o` shows **no control at all**, while `openai/o3` gets the full scale.
-Detection asks Ollama's `/api/show` for local models and `litellm.supports_reasoning()` for
-hosted ones, with a short table of models measured directly here where LiteLLM's metadata is
-wrong (Baseten's DeepSeek V4 Flash reports `supports_reasoning=False` but demonstrably reasons).
-
-The waiting indicator follows the same truth: it says **Thinking** only when the model really is
-reasoning, and **Working** otherwise.
-
-Values: `none | minimal | low | medium | high`; empty leaves the provider default alone.
-
-**It behaves differently per provider, so measure rather than assume:**
-
-| Model | Control offered |
-|---|---|
-| `ollama_chat/<tool-capable model>` | Off / On - LiteLLM maps effort to Ollama's boolean `think` flag, so there is no gradation |
-| `openai/o3`, `anthropic/claude-sonnet-4-5` | The full scale |
-| `openai/gpt-4o`, `groq/llama-3.3-70b` | **None** - not reasoning models |
-| `baseten/…DeepSeek-V4-Flash` | **None** - it reasons, but the provider rejects `reasoning_effort` entirely |
-
-Two separate questions decide this: does the model reason (`litellm.supports_reasoning`, or
-Ollama's own capabilities list), and does the provider accept the parameter
-(`get_supported_openai_params`). A model that reasons but rejects the parameter gets no
-control, because sending it raises `UnsupportedParamsError` and fails **every** request rather
-than tuning anything. The agent refuses to send it in that case and logs why.
-
-Measured on `gemma4:e4b`, same P&L question through the full agent:
-
-```
-LITELLM_REASONING_EFFORT=          15.5s   1599 thinking characters
-LITELLM_REASONING_EFFORT=none       6.7s      0 thinking characters
-```
-
-Turning thinking off made it **2.3x faster** with no loss on this kind of question. It is the
-single most effective latency setting for a local model.
-
-Beware when measuring this yourself: `litellm.drop_params = True` silently **discards**
-`reasoning_effort`, so every level becomes the same request and the differences you see are
-noise. Measure with `drop_params=False`, which raises on a provider that does not support it.
-
-### The reasoning-model trap
-
-The Baseten default is a **reasoning model**: it spends completion tokens on hidden reasoning
-before emitting any content, so a small `max_tokens` returns an **empty** reply rather than a
-short one. `LITELLM_MAX_TOKENS=4096` is a correctness requirement, not a cost dial. Time to
-first visible token is around 1.7 seconds.
-
-This compounds with the setting above - reasoning is billed from the **same budget as the
-reply**. Measured: `reasoning_effort=high` with `max_tokens=1500` spent 1498 tokens thinking and
-returned **empty content**. The agent logs a warning if you combine a high effort with a low
-token budget.
+The order tests refuse to run unless OpenAlgo reports analyzer mode, so they never place a real
+order.
 
 ## Layout
 
 ```
 backend/app/
-  config.py           settings and ASCII logging
+  version.py          the single source of truth for the version
+  config.py           settings and logging
   agent.py            model wiring, instructions, per-run tool scoping
-  main.py             FastAPI, SSE, the confirmation loop, sessions
-  openalgo/           client, response envelope, constants, frame cache
-  indicators/         127-entry registry, descriptions, dispatcher
-  safety/             RiskGuard, AuditLog
+  main.py             FastAPI, SSE streaming, the approval loop, sessions
+  openalgo/           broker client, response handling, symbols, candle cache
+  indicators/         127-indicator registry and dispatcher
+  safety/             RiskGuard and the audit trail
   tools/              8 toolkits, 43 tools
 frontend/src/
-  lib/                sse, api, Indian number formatting
   components/         Sidebar, ModeBanner, Message, ToolTimeline,
-                      ConfirmCard, DataTable, Composer
+                      ConfirmCard, DataTable, Composer, ThinkingSelector
 docs/
-  plan/PLAN.md        the build plan
+  CHANGELOG.md        what changed, per version
+  model-notes.md      choosing a model, and the provider bugs worked around
+  plan/PLAN.md        the design document
   progress/           what was built and validated, per iteration
-  reference/          research notes behind the plan
 ```
 
 ## Documentation
 
-`docs/plan/PLAN.md` is the design document. `docs/progress/` records each iteration with real
-validation output. `docs/reference/research-notes/` holds the notes behind the plan, written by
-executing the installed libraries rather than reading their docs - which is how several
-documented behaviours turned out to be wrong.
+- **[docs/model-notes.md](docs/model-notes.md)** - choosing a model, thinking control, and the
+  provider bugs the agent works around automatically.
+- **[docs/CHANGELOG.md](docs/CHANGELOG.md)** - what changed in each version.
+- **[docs/plan/PLAN.md](docs/plan/PLAN.md)** - the design document.
+- **[docs/progress/](docs/progress/)** - each build iteration with its real validation output.
+
+## Version
+
+Maintained in `backend/app/version.py` as the single source of truth, and served on
+`GET /api/health`.
 
 ## Not investment advice
 
-This software executes instructions and presents data. It does not give investment advice.
-Trading carries risk of loss. You are responsible for every order you approve.
+This software carries out your instructions and shows you data. It does not give investment
+advice and will not tell you what to buy or sell. Trading carries risk of loss. You are
+responsible for every order you approve.
 
 ## Licence
 

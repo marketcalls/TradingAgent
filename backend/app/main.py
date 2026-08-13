@@ -40,6 +40,7 @@ from .agent import build_agent  # noqa: E402
 from .openalgo.client import get_client  # noqa: E402
 from .openalgo.normalize import sanitize_text  # noqa: E402
 from .safety.audit import get_audit_log  # noqa: E402
+from .version import get_version  # noqa: E402
 
 log = logging.getLogger("app")
 
@@ -72,7 +73,7 @@ def get_agent(effort: str | None = None):
             log.info("built agent for reasoning_effort=%s", key)
         return built
 
-app = FastAPI(title="OpenAlgo Trading Agent")
+app = FastAPI(title="OpenAlgo Trading Agent", version=get_version())
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -360,6 +361,7 @@ async def health() -> dict[str, Any]:
     ping = client.ping()
     return {
         "ok": True,
+        "version": get_version(),
         "model": settings.litellm_model,
         "missing_keys": settings.missing(),
         "openalgo_connected": bool(ping.get("ok")),
