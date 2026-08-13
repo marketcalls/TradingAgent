@@ -103,8 +103,8 @@ def start_server() -> subprocess.Popen:
 def main() -> int:
     print("Confirmation loop end-to-end test")
     settings = get_settings()
-    if not settings.openalgo_api_key or not settings.baseten_api_key:
-        skip("all checks", "missing OPENALGO_API_KEY or BASETEN_API_KEY")
+    if not settings.openalgo_api_key or not settings.resolve_model_api_key():
+        skip("all checks", "missing OPENALGO_API_KEY or LITELLM_API_KEY")
         return 0
 
     proc = None

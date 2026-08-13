@@ -5,7 +5,7 @@ litellm 1.79.1:
 
   - litellm 1.79.1 has a first-class baseten provider. A model id that is not an
     8-character deployment code routes to https://inference.baseten.co/v1 and reads
-    BASETEN_API_KEY. tools and tool_choice are both supported on that path.
+    LITELLM_API_KEY. tools and tool_choice are both supported on that path.
 
   - DeepSeek V4 Flash is a REASONING model. It spends completion tokens on hidden
     reasoning before emitting any content. At max_tokens=16 the whole budget went to
@@ -31,6 +31,7 @@ from agno.models.litellm import LiteLLM
 from agno.run import RunContext
 
 from .config import Settings, get_settings
+from .model_providers import prepare_provider
 from .tools.account import AccountTools
 from .tools.indicators import IndicatorTools
 from .tools.market import MarketDataTools
@@ -155,20 +156,55 @@ def build_tool_factory(settings: Settings):
 
 
 def build_model(settings: Settings) -> LiteLLM:
+    """Build the model from whatever provider LITELLM_MODEL names.
+
+    LiteLLM is here for portability: the same agent runs against Baseten, OpenAI,
+    Anthropic, Gemini, Groq, OpenRouter or a local Ollama model, decided entirely by
+    the prefix on LITELLM_MODEL. Two details make that work:
+
+      - A local provider gets api_key=None. Passing an empty string instead makes some
+        LiteLLM paths send an Authorization header, which local servers do not expect.
+      - api_base is only passed when set, so LiteLLM resolves each provider's own
+        default endpoint (including http://localhost:11434 for Ollama).
+
+    Tool calling is not optional for this agent, so a local model must be one that
+    supports tools. `ollama list` shows the capability; gemma4:e4b and llama3.1 do.
+    """
+    # LiteLLM's static table does not know most Ollama tags and would fall back to a
+    # broken JSON-emulation path. Ask Ollama what the model can actually do first.
+    prepare_provider(settings.litellm_model, settings.resolve_model_api_base())
+
     request_params: dict[str, Any] = {}
-    if settings.litellm_include_usage:
+    # stream_options is an OpenAI-style extra. Ollama rejects unknown fields, so it is
+    # only sent to hosted providers.
+    if settings.litellm_include_usage and not settings.is_local_model:
         request_params["stream_options"] = {"include_usage": True}
 
-    return LiteLLM(
-        id=settings.litellm_model,
-        api_key=settings.baseten_api_key,
-        api_base=settings.litellm_api_base,
-        temperature=settings.litellm_temperature,
-        top_p=settings.litellm_top_p,
-        # A reasoning model: a small cap returns EMPTY content, not short content.
-        max_tokens=settings.litellm_max_tokens,
-        request_params=request_params or None,
-    )
+    kwargs: dict[str, Any] = {
+        "id": settings.litellm_model,
+        "temperature": settings.litellm_temperature,
+        "top_p": settings.litellm_top_p,
+        # For a reasoning model a small cap returns EMPTY content, not short content.
+        "max_tokens": settings.litellm_max_tokens,
+        "request_params": request_params or None,
+    }
+
+    api_key = settings.resolve_model_api_key()
+    if api_key:
+        kwargs["api_key"] = api_key
+    elif settings.is_local_model:
+        # A local server needs no credential, but agno's __post_init__ falls back to
+        # getenv("LITELLM_API_KEY") when api_key is None and logs a misleading ERROR if
+        # that is unset. A placeholder stops the noise; local providers ignore it.
+        kwargs["api_key"] = "local"
+    api_base = settings.resolve_model_api_base()
+    if api_base:
+        kwargs["api_base"] = api_base
+
+    log.info("model %s provider=%s local=%s",
+             settings.litellm_model, settings.model_provider or "inferred",
+             settings.is_local_model)
+    return LiteLLM(**kwargs)
 
 
 def build_agent(settings: Settings | None = None) -> Agent:

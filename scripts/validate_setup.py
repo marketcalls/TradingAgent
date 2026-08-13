@@ -221,13 +221,13 @@ QUOTE_TOOL = [{
 
 def check_litellm() -> None:
     print("\n=== Part B: LiteLLM -> Baseten ===")
-    key = os.getenv("BASETEN_API_KEY", "")
+    key = os.getenv("LITELLM_API_KEY", "")
     model = os.getenv("LITELLM_MODEL", "baseten/deepseek-ai/DeepSeek-V4-Flash-0731")
     api_base = os.getenv("LITELLM_API_BASE", "https://inference.baseten.co/v1")
     print(f"  model={model}  api_base={api_base}  key={mask(key)}")
 
     if not key:
-        record("baseten api key present", FAIL, "BASETEN_API_KEY is empty")
+        record("model api key present", FAIL, "LITELLM_API_KEY is empty")
         return
 
     import litellm
@@ -362,11 +362,11 @@ def check_litellm() -> None:
 
 def check_agno() -> None:
     print("\n=== Part C: Agno agent (model + tools + confirmation gate) ===")
-    key = os.getenv("BASETEN_API_KEY", "")
+    key = os.getenv("LITELLM_API_KEY", "")
     model_id = os.getenv("LITELLM_MODEL", "baseten/deepseek-ai/DeepSeek-V4-Flash-0731")
     api_base = os.getenv("LITELLM_API_BASE", "https://inference.baseten.co/v1")
     if not key:
-        record("agno agent", SKIP, "no BASETEN_API_KEY")
+        record("agno agent", SKIP, "no LITELLM_API_KEY")
         return
 
     try:

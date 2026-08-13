@@ -65,10 +65,11 @@ class Settings:
     openalgo_timeout: float = 15.0
     openalgo_instruments_timeout: float = 30.0
 
-    # Model
-    baseten_api_key: str = ""
+    # Model. LiteLLM fronts every provider, so there is ONE key and ONE optional base
+    # URL; the provider is decided by the prefix on litellm_model.
+    litellm_api_key: str = ""
     litellm_model: str = "baseten/deepseek-ai/DeepSeek-V4-Flash-0731"
-    litellm_api_base: str = "https://inference.baseten.co/v1"
+    litellm_api_base: str = ""
     litellm_temperature: float = 0.2
     litellm_top_p: float = 1.0
     # This model reasons before it answers. A low cap returns EMPTY content, not short
@@ -112,9 +113,10 @@ class Settings:
             openalgo_api_version=_env("OPENALGO_API_VERSION", "v1"),
             openalgo_timeout=_env_float("OPENALGO_TIMEOUT", 15.0),
             openalgo_instruments_timeout=_env_float("OPENALGO_INSTRUMENTS_TIMEOUT", 30.0),
-            baseten_api_key=_env("BASETEN_API_KEY"),
+            litellm_api_key=_env("LITELLM_API_KEY"),
             litellm_model=_env("LITELLM_MODEL", "baseten/deepseek-ai/DeepSeek-V4-Flash-0731"),
-            litellm_api_base=_env("LITELLM_API_BASE", "https://inference.baseten.co/v1"),
+            # Empty means "let LiteLLM resolve the provider's own default endpoint".
+            litellm_api_base=_env("LITELLM_API_BASE"),
             litellm_temperature=_env_float("LITELLM_TEMPERATURE", 0.2),
             litellm_top_p=_env_float("LITELLM_TOP_P", 1.0),
             litellm_max_tokens=_env_int("LITELLM_MAX_TOKENS", 4096),
@@ -144,12 +146,41 @@ class Settings:
             whatsapp_default_to=_env("WHATSAPP_DEFAULT_TO"),
         )
 
+    # Providers that run on your own machine and need no credential at all.
+    LOCAL_PROVIDERS = ("ollama", "ollama_chat", "lm_studio", "llamafile", "vllm")
+
+    @property
+    def model_provider(self) -> str:
+        """The LiteLLM provider prefix, e.g. 'ollama' from 'ollama_chat/gemma4:e4b'."""
+        return self.litellm_model.split("/", 1)[0].strip().lower() if "/" in self.litellm_model else ""
+
+    @property
+    def is_local_model(self) -> bool:
+        return self.model_provider in self.LOCAL_PROVIDERS
+
+    def resolve_model_api_key(self) -> str | None:
+        """The single credential for the configured provider, or None if none is needed.
+
+        There is deliberately only one key setting. Whichever provider LITELLM_MODEL
+        names, LITELLM_API_KEY is its key. Local providers get None, because passing an
+        empty string makes some LiteLLM paths send an Authorization header that a local
+        server does not expect.
+        """
+        if self.is_local_model:
+            return None
+        return self.litellm_api_key or None
+
+    def resolve_model_api_base(self) -> str | None:
+        """Explicit base URL, or None to let LiteLLM use the provider default."""
+        return self.litellm_api_base or None
+
     def missing(self) -> list[str]:
         names = []
         if not self.openalgo_api_key:
             names.append("OPENALGO_API_KEY")
-        if not self.baseten_api_key:
-            names.append("BASETEN_API_KEY")
+        # A local model needs no credential; every hosted provider needs LITELLM_API_KEY.
+        if not self.is_local_model and not self.resolve_model_api_key():
+            names.append("LITELLM_API_KEY")
         return names
 
     def kill_switch_engaged(self) -> bool:
@@ -161,8 +192,11 @@ class Settings:
         return {
             "openalgo_host": self.openalgo_host,
             "openalgo_api_key": mask(self.openalgo_api_key),
-            "baseten_api_key": mask(self.baseten_api_key),
             "litellm_model": self.litellm_model,
+            "model_provider": self.model_provider or "(none, LiteLLM will infer)",
+            "is_local_model": self.is_local_model,
+            "model_api_key": mask(self.resolve_model_api_key() or ""),
+            "model_api_base": self.resolve_model_api_base() or "(provider default)",
             "litellm_max_tokens": self.litellm_max_tokens,
             "trading_enabled": self.trading_enabled,
             "require_analyzer_mode": self.require_analyzer_mode,

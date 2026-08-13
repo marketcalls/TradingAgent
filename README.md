@@ -80,7 +80,7 @@ Two keys are required in `.env`:
 | Key | Where it comes from |
 |---|---|
 | `OPENALGO_API_KEY` | The OpenAlgo web app, after logging in with your broker |
-| `BASETEN_API_KEY` | Your Baseten account |
+| `LITELLM_API_KEY` | Your model provider. Leave empty for a local Ollama model |
 
 Everything else has a working default. `.env` is gitignored.
 
@@ -125,14 +125,49 @@ place a real order.
 
 ## Model
 
-LiteLLM routed to Baseten, running `deepseek-ai/DeepSeek-V4-Flash-0731` by default.
+Everything goes through LiteLLM, so any provider works - cloud or local. There is **one key**
+and one optional base URL; the prefix on `LITELLM_MODEL` decides the provider.
 
-This is a **reasoning model**, which has one consequence worth knowing: it spends completion
-tokens on hidden reasoning before emitting any content, so a small `max_tokens` returns an
-**empty** reply rather than a short one. `LITELLM_MAX_TOKENS=4096` is a correctness requirement,
-not a cost dial. Time to first visible token is around 1.7 seconds.
+```bash
+# Baseten (default)
+LITELLM_MODEL=baseten/deepseek-ai/DeepSeek-V4-Flash-0731
+LITELLM_API_KEY=<baseten key>
 
-Any LiteLLM-supported model works - change `LITELLM_MODEL` and `LITELLM_API_BASE`.
+# OpenAI
+LITELLM_MODEL=openai/gpt-5.2
+LITELLM_API_KEY=sk-<openai key>
+
+# Local, via Ollama - no key at all
+LITELLM_MODEL=ollama_chat/llama3.1
+LITELLM_API_KEY=
+```
+
+Anthropic, Gemini, Groq, OpenRouter and LM Studio follow the same shape. `.env.example` lists
+them.
+
+### The agent needs tool calling
+
+Every answer comes from a tool, so a model that cannot call tools is useless here.
+
+**Running locally with Ollama:** use the `ollama_chat/` prefix, not `ollama/`, and pick a
+tool-capable model (`ollama show <model>` lists `tools` under capabilities). The agent reads
+that at startup and registers it with LiteLLM, because **LiteLLM's own model table is stale** -
+it reports `supports_function_calling=False` for most Ollama tags and silently falls back to a
+JSON-emulation path that either crashes on the turn after a tool result or returns an empty
+reply. That correction lives in `backend/app/model_providers.py`.
+
+**Expect a quality drop on small local models.** Measured with `gemma4:e4b` (8B) against the
+full 26-tool read-only agent: it looped through 15 tool calls on a simple quote request, and on
+another it claimed it had no way to fetch funds while `get_funds` was in scope. The plumbing is
+fine; an 8B model just cannot choose reliably among that many tools. If you want to run local,
+either use a larger tool-capable model, or narrow the toolset.
+
+### The reasoning-model trap
+
+The default Baseten model is a **reasoning model**: it spends completion tokens on hidden
+reasoning before emitting any content, so a small `max_tokens` returns an **empty** reply rather
+than a short one. `LITELLM_MAX_TOKENS=4096` is a correctness requirement, not a cost dial.
+Time to first visible token is around 1.7 seconds.
 
 ## Layout
 
