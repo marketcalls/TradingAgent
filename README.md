@@ -149,18 +149,37 @@ them.
 
 Every answer comes from a tool, so a model that cannot call tools is useless here.
 
-**Running locally with Ollama:** use the `ollama_chat/` prefix, not `ollama/`, and pick a
-tool-capable model (`ollama show <model>` lists `tools` under capabilities). The agent reads
-that at startup and registers it with LiteLLM, because **LiteLLM's own model table is stale** -
-it reports `supports_function_calling=False` for most Ollama tags and silently falls back to a
-JSON-emulation path that either crashes on the turn after a tool result or returns an empty
-reply. That correction lives in `backend/app/model_providers.py`.
+**Running locally with Ollama:** use the `ollama_chat/` prefix and a tool-capable model
+(`ollama show <model>` lists `tools` under capabilities). Two LiteLLM bugs sit on that path,
+both corrected automatically in `backend/app/model_providers.py`:
 
-**Expect a quality drop on small local models.** Measured with `gemma4:e4b` (8B) against the
-full 26-tool read-only agent: it looped through 15 tool calls on a simple quote request, and on
-another it claimed it had no way to fetch funds while `get_funds` was in scope. The plumbing is
-fine; an 8B model just cannot choose reliably among that many tools. If you want to run local,
-either use a larger tool-capable model, or narrow the toolset.
+1. **LiteLLM's model table is stale.** It reports `supports_function_calling=False` for most
+   Ollama tags and falls back to a JSON-emulation path that either crashes on the turn after a
+   tool result or returns an empty reply. The agent asks Ollama for the model's real
+   capabilities and registers the truth.
+
+2. **LiteLLM drops `tool_calls` from assistant messages.** `OllamaChatConfig.transform_request`
+   converts them, then builds the outgoing message copying only role, thinking, content and
+   images. Ollama therefore sees a tool result for a call it has no record of, so the model
+   calls the tool again - forever, with an empty final answer. The agent restores them.
+
+   The same exchange against Ollama's native `/api/chat` answered correctly and called nothing,
+   which is how this was isolated: the model was never the problem.
+
+### Tool profile
+
+`TOOL_PROFILE` is `full` (43 tools) or `lean` (15). Empty picks automatically: **lean for local
+models, full otherwise**.
+
+Small models cannot choose reliably among 43 tools. With `gemma4:e4b` (8B) on the full set, a
+simple quote request produced 16 tool calls against the wrong symbol and an answer about market
+depth; asked for funds, it claimed it had no such function while `get_funds` was in scope.
+
+On the lean profile, with both LiteLLM bugs corrected, the same model answers each of those in
+**a single tool call** with a correct markdown table. Lean also shortens the instruction set and
+caps `tool_call_limit` at 6, so a confused model stops instead of looping.
+
+Set `TOOL_PROFILE=full` to override, at the cost of reliability on a small model.
 
 ### The reasoning-model trap
 

@@ -102,7 +102,74 @@ def register_ollama_tool_support(model_id: str, api_base: str | None = None) -> 
         return False
 
 
+def patch_ollama_tool_call_roundtrip() -> bool:
+    """Work around a LiteLLM bug that breaks the tool-result round trip on Ollama.
+
+    In litellm 1.79.1, OllamaChatConfig.transform_request converts each assistant
+    message's tool_calls into Ollama's shape:
+
+        cast(dict, m)["tool_calls"] = new_tools
+
+    but then builds the message it actually sends from scratch and copies only role,
+    thinking, content and images:
+
+        ollama_message = OllamaChatCompletionMessage(role=...)
+        ... thinking / content / images ...
+        new_messages.append(ollama_message)
+
+    tool_calls is never copied across. So on the turn after a tool runs, Ollama receives
+    an assistant message with no record of having called anything, followed by a tool
+    result for a call it cannot see. The model has no choice but to call the tool again,
+    which shows up as an endless loop and an empty final answer.
+
+    Verified against gemma4:e4b: through LiteLLM the follow-up turn re-called get_funds
+    and returned empty content, while the identical exchange against Ollama's native
+    /api/chat answered "You have an available balance of 9,999,977.02" and called
+    nothing. The model was never the problem.
+
+    This copies the already-converted tool_calls onto the outgoing message. It is
+    idempotent and a no-op if LiteLLM fixes the bug and starts sending them itself.
+    """
+    try:
+        from litellm.llms.ollama.chat.transformation import OllamaChatConfig
+    except Exception:  # noqa: BLE001
+        return False
+
+    if getattr(OllamaChatConfig, "_oa_tool_calls_patched", False):
+        return True
+
+    original = OllamaChatConfig.transform_request
+
+    def transform_request(self, model, messages, optional_params, litellm_params, headers):
+        # The original mutates each source message in place, replacing tool_calls with
+        # the Ollama-shaped list, so after this call the converted form is available.
+        data = original(self, model=model, messages=messages,
+                        optional_params=optional_params,
+                        litellm_params=litellm_params, headers=headers)
+        try:
+            outgoing = data.get("messages") or []
+            for src, dst in zip(messages, outgoing):
+                if not isinstance(dst, dict) or dst.get("tool_calls"):
+                    continue
+                if hasattr(src, "model_dump"):
+                    src = src.model_dump(exclude_none=True)
+                if not isinstance(src, dict):
+                    continue
+                calls = src.get("tool_calls")
+                if calls:
+                    dst["tool_calls"] = calls
+        except Exception:  # noqa: BLE001
+            log.warning("could not restore ollama tool_calls", exc_info=True)
+        return data
+
+    OllamaChatConfig.transform_request = transform_request
+    OllamaChatConfig._oa_tool_calls_patched = True
+    log.info("patched litellm OllamaChatConfig to send assistant tool_calls")
+    return True
+
+
 def prepare_provider(model_id: str, api_base: str | None = None) -> None:
     """Apply any provider-specific corrections needed before building the model."""
     if model_id.startswith(("ollama/", "ollama_chat/")):
         register_ollama_tool_support(model_id, api_base)
+        patch_ollama_tool_call_roundtrip()

@@ -105,24 +105,54 @@ INSTRUCTIONS = [
 ]
 
 
-def _read_only_toolkits(client=None, frames=None) -> list:
+# The lean profile. Small local models cannot choose reliably among 26 tools, so this
+# keeps only the ones that answer the great majority of questions. Names are checked by
+# agno's include_tools, which RAISES on a typo, so a rename here fails loudly.
+LEAN_READ_ONLY: dict[str, list[str]] = {
+    "market": ["get_quote", "get_history", "get_market_depth"],
+    "symbols": ["search_symbols"],
+    "account": ["get_funds", "get_positionbook", "get_holdings", "get_orderbook"],
+    "indicators": ["compute_indicator", "list_indicators"],
+    "system": ["get_analyzer_status"],
+}
+LEAN_ORDERS: list[str] = ["place_order", "modify_order", "cancel_order", "get_order_status"]
+
+
+def _read_only_toolkits(client=None, frames=None, lean: bool = False) -> list:
+    if not lean:
+        return [
+            MarketDataTools(client=client, frames=frames),
+            SymbolTools(client=client),
+            AccountTools(client=client),
+            IndicatorTools(client=client, frames=frames),
+            SystemTools(client=client),
+        ]
     return [
-        MarketDataTools(client=client, frames=frames),
-        SymbolTools(client=client),
-        AccountTools(client=client),
-        IndicatorTools(client=client, frames=frames),
-        SystemTools(client=client),
+        MarketDataTools(client=client, frames=frames,
+                        include_tools=LEAN_READ_ONLY["market"]),
+        SymbolTools(client=client, include_tools=LEAN_READ_ONLY["symbols"]),
+        AccountTools(client=client, include_tools=LEAN_READ_ONLY["account"]),
+        IndicatorTools(client=client, frames=frames,
+                       include_tools=LEAN_READ_ONLY["indicators"]),
+        SystemTools(client=client, include_tools=LEAN_READ_ONLY["system"]),
     ]
 
 
-def _order_toolkits(client=None) -> list:
-    """Imported lazily so a partial checkout still runs the read-only agent."""
+def _order_toolkits(client=None, lean: bool = False) -> list:
+    """Imported lazily so a partial checkout still runs the read-only agent.
+
+    In lean mode only the four core order tools are exposed. The gated set is
+    unchanged - every one of them still requires confirmation.
+    """
     kits: list = []
     try:
         from .tools.orders import OrderTools
-        kits.append(OrderTools(client=client))
+        kits.append(OrderTools(client=client,
+                               **({"include_tools": LEAN_ORDERS} if lean else {})))
     except ImportError:
         log.warning("order tools unavailable")
+    if lean:
+        return kits
     try:
         from .tools.gtt import GttTools
         kits.append(GttTools(client=client))
@@ -144,12 +174,14 @@ def build_tool_factory(settings: Settings):
     session cannot reach an order tool at all.
     """
 
+    lean = settings.effective_tool_profile == "lean"
+
     def get_tools(run_context: RunContext) -> list:
-        kits = _read_only_toolkits()
+        kits = _read_only_toolkits(lean=lean)
         state = getattr(run_context, "session_state", None) or {}
         session_allows = bool(state.get("trading_enabled", settings.trading_enabled))
         if settings.trading_enabled and session_allows:
-            kits.extend(_order_toolkits())
+            kits.extend(_order_toolkits(lean=lean))
         return kits
 
     return get_tools
@@ -207,8 +239,30 @@ def build_model(settings: Settings) -> LiteLLM:
     return LiteLLM(**kwargs)
 
 
+# A short instruction set for small models. The full list is 18 blocks, which crowds an
+# 8B model's context alongside the tool schemas and measurably degrades tool selection.
+LEAN_INSTRUCTIONS = [
+    "Answer using your tools. Call a tool once, read the result, then answer from it.",
+    "Do not call the same tool repeatedly with the same arguments. If a tool has already "
+    "returned what you need, answer instead of calling it again.",
+    "Only call tools for the instrument the user actually named. Never substitute a "
+    "different symbol.",
+    "Symbols are OpenAlgo format: equity is the bare symbol (SBIN, RELIANCE). If a symbol "
+    "is not found, call search_symbols once.",
+    "Products are MIS, CNC or NRML. Price types are MARKET, LIMIT, SL, SL-M.",
+    "When the user gives a complete order instruction, call the order tool. The interface "
+    "asks the user to approve it, so do not ask for confirmation in your reply.",
+    "Say whether an order is simulated (analyze mode) or real (live mode).",
+    "Answer in markdown, using a table when there is more than one row of data.",
+    "Never invent a price, a position, or an order id.",
+]
+
+
 def build_agent(settings: Settings | None = None) -> Agent:
     settings = settings or get_settings()
+    lean = settings.effective_tool_profile == "lean"
+    if lean:
+        log.info("lean tool profile active for %s", settings.litellm_model)
 
     return Agent(
         id="openalgo-trading-agent",
@@ -220,7 +274,7 @@ def build_agent(settings: Settings | None = None) -> Agent:
         tools=build_tool_factory(settings),
         cache_callables=False,
         description=DESCRIPTION,
-        instructions=INSTRUCTIONS,
+        instructions=LEAN_INSTRUCTIONS if lean else INSTRUCTIONS,
         expected_output=(
             "A direct answer. Tables for anything with more than one row. State the "
             "analyzer mode whenever an order is involved."
@@ -230,13 +284,15 @@ def build_agent(settings: Settings | None = None) -> Agent:
         timezone_identifier=settings.timezone,
         add_location_to_context=False,
         add_history_to_context=True,
-        num_history_runs=5,
+        num_history_runs=2 if lean else 5,
         store_history_messages=False,
         store_tool_messages=True,
-        # Higher than the equity sibling's 14: a trading question legitimately chains
-        # search, expiry, resolve, quote, margin and place.
-        tool_call_limit=20,
-        max_tool_calls_from_history=6,
+        # Full: higher than the equity sibling's 14, because a trading question
+        # legitimately chains search, expiry, resolve, quote, margin and place.
+        # Lean: a hard stop on the runaway loops small models fall into - gemma4:e4b
+        # was observed making 16 calls on a single quote request.
+        tool_call_limit=6 if lean else 20,
+        max_tool_calls_from_history=3 if lean else 6,
         telemetry=False,
         store_events=False,
     )

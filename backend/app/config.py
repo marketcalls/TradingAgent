@@ -70,6 +70,9 @@ class Settings:
     litellm_api_key: str = ""
     litellm_model: str = "baseten/deepseek-ai/DeepSeek-V4-Flash-0731"
     litellm_api_base: str = ""
+    # "full" (43 tools), "lean" (a small high-value subset), or "" to choose
+    # automatically: lean for local models, full otherwise.
+    tool_profile: str = ""
     litellm_temperature: float = 0.2
     litellm_top_p: float = 1.0
     # This model reasons before it answers. A low cap returns EMPTY content, not short
@@ -115,6 +118,7 @@ class Settings:
             openalgo_instruments_timeout=_env_float("OPENALGO_INSTRUMENTS_TIMEOUT", 30.0),
             litellm_api_key=_env("LITELLM_API_KEY"),
             litellm_model=_env("LITELLM_MODEL", "baseten/deepseek-ai/DeepSeek-V4-Flash-0731"),
+            tool_profile=_env("TOOL_PROFILE").lower(),
             # Empty means "let LiteLLM resolve the provider's own default endpoint".
             litellm_api_base=_env("LITELLM_API_BASE"),
             litellm_temperature=_env_float("LITELLM_TEMPERATURE", 0.2),
@@ -173,6 +177,20 @@ class Settings:
     def resolve_model_api_base(self) -> str | None:
         """Explicit base URL, or None to let LiteLLM use the provider default."""
         return self.litellm_api_base or None
+
+    @property
+    def effective_tool_profile(self) -> str:
+        """'lean' or 'full'.
+
+        Measured on gemma4:e4b (8B) with the full 26-tool read-only agent: it looped
+        through 15 tool calls on a single quote request, and separately claimed it had
+        no way to fetch funds while get_funds was in scope. Small models cannot choose
+        reliably among that many tools, so local defaults to lean. Override with
+        TOOL_PROFILE=full.
+        """
+        if self.tool_profile in ("lean", "full"):
+            return self.tool_profile
+        return "lean" if self.is_local_model else "full"
 
     def missing(self) -> list[str]:
         names = []
