@@ -181,12 +181,39 @@ caps `tool_call_limit` at 6, so a confused model stops instead of looping.
 
 Set `TOOL_PROFILE=full` to override, at the cost of reliability on a small model.
 
+### Thinking / reasoning effort
+
+`LITELLM_REASONING_EFFORT` controls how much the model thinks before answering. Empty leaves the
+provider default alone; otherwise `none | minimal | low | medium | high`.
+
+**It behaves differently per provider, so measure rather than assume:**
+
+| Provider | `none` | `low`/`medium`/`high` |
+|---|---|---|
+| Ollama | **Turns thinking off.** LiteLLM maps it to Ollama's boolean `think` flag | All mean "on" - no gradation |
+| Baseten (DeepSeek V4 Flash) | Does **not** stop it reasoning | Scales the budget: low ~1283 reasoning tokens, high ~1498 |
+
+Measured on `gemma4:e4b`, same P&L question through the full agent:
+
+```
+LITELLM_REASONING_EFFORT=          15.5s   1599 thinking characters
+LITELLM_REASONING_EFFORT=none       6.7s      0 thinking characters
+```
+
+Turning thinking off made it **2.3x faster** with no loss on this kind of question. It is the
+single most effective latency setting for a local model.
+
 ### The reasoning-model trap
 
-The default Baseten model is a **reasoning model**: it spends completion tokens on hidden
-reasoning before emitting any content, so a small `max_tokens` returns an **empty** reply rather
-than a short one. `LITELLM_MAX_TOKENS=4096` is a correctness requirement, not a cost dial.
-Time to first visible token is around 1.7 seconds.
+The Baseten default is a **reasoning model**: it spends completion tokens on hidden reasoning
+before emitting any content, so a small `max_tokens` returns an **empty** reply rather than a
+short one. `LITELLM_MAX_TOKENS=4096` is a correctness requirement, not a cost dial. Time to
+first visible token is around 1.7 seconds.
+
+This compounds with the setting above - reasoning is billed from the **same budget as the
+reply**. Measured: `reasoning_effort=high` with `max_tokens=1500` spent 1498 tokens thinking and
+returned **empty content**. The agent logs a warning if you combine a high effort with a low
+token budget.
 
 ## Layout
 

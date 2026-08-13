@@ -79,6 +79,9 @@ class Settings:
     # content, because the whole budget goes to reasoning tokens. Do not lower this.
     litellm_max_tokens: int = 4096
     litellm_include_usage: bool = True
+    # "" (provider default), or none | minimal | low | medium | high.
+    # "none" switches thinking OFF where the provider supports it.
+    litellm_reasoning_effort: str = ""
 
     # Risk
     trading_enabled: bool = False
@@ -125,6 +128,7 @@ class Settings:
             litellm_top_p=_env_float("LITELLM_TOP_P", 1.0),
             litellm_max_tokens=_env_int("LITELLM_MAX_TOKENS", 4096),
             litellm_include_usage=_env_bool("LITELLM_INCLUDE_USAGE", True),
+            litellm_reasoning_effort=_env("LITELLM_REASONING_EFFORT").lower(),
             trading_enabled=_env_bool("TRADING_ENABLED", False),
             require_analyzer_mode=_env_bool("REQUIRE_ANALYZER_MODE", True),
             default_strategy_name=_env("DEFAULT_STRATEGY_NAME", "TradingAgent"),
@@ -177,6 +181,40 @@ class Settings:
     def resolve_model_api_base(self) -> str | None:
         """Explicit base URL, or None to let LiteLLM use the provider default."""
         return self.litellm_api_base or None
+
+    REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high")
+
+    def resolve_reasoning_effort(self) -> str | None:
+        """Validated reasoning effort, or None to leave the provider's default alone.
+
+        Measured behaviour differs sharply by provider, so this is a request, not a
+        guarantee:
+
+          Ollama (gemma4:e4b) - LiteLLM maps reasoning_effort onto Ollama's `think`
+            flag, which is a BOOLEAN. "none" genuinely turns thinking off (measured:
+            1869 thinking characters and 18.4s, down to 0 and 7.8s). Any of
+            low/medium/high simply means "on"; there is no gradation.
+
+          Baseten (DeepSeek V4 Flash) - the value is passed through and does scale the
+            reasoning budget (low -> 1283 reasoning tokens, high -> 1498), but "none"
+            does NOT disable it. Raising effort without also raising max_tokens can
+            consume the whole budget and return EMPTY content; see the warning in
+            build_model.
+        """
+        value = (self.litellm_reasoning_effort or "").strip().lower()
+        if not value:
+            return None
+        if value not in self.REASONING_EFFORTS:
+            import logging
+            logging.getLogger(__name__).warning(
+                "LITELLM_REASONING_EFFORT=%r is not one of %s; ignoring it.",
+                value, ", ".join(self.REASONING_EFFORTS))
+            return None
+        return value
+
+    @property
+    def thinking_disabled(self) -> bool:
+        return self.resolve_reasoning_effort() == "none"
 
     @property
     def effective_tool_profile(self) -> str:

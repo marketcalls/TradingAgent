@@ -212,6 +212,28 @@ def build_model(settings: Settings) -> LiteLLM:
     if settings.litellm_include_usage and not settings.is_local_model:
         request_params["stream_options"] = {"include_usage": True}
 
+    effort = settings.resolve_reasoning_effort()
+    if effort:
+        # request_params is merged last by agno, so this reaches every sync, async and
+        # streaming call.
+        request_params["reasoning_effort"] = effort
+        if settings.is_local_model:
+            # LiteLLM turns this into Ollama's boolean `think` flag.
+            log.info("reasoning_effort=%s -> thinking %s", effort,
+                     "OFF" if effort == "none" else "ON")
+        else:
+            log.info("reasoning_effort=%s", effort)
+            # Measured on DeepSeek V4 Flash: effort=high spent 1498 reasoning tokens and
+            # returned EMPTY content at max_tokens=1500. Reasoning is billed out of the
+            # same budget as the answer.
+            if effort in ("medium", "high") and settings.litellm_max_tokens < 4096:
+                log.warning(
+                    "LITELLM_REASONING_EFFORT=%s with LITELLM_MAX_TOKENS=%d is risky: on a "
+                    "reasoning model the hidden reasoning is billed from the same budget "
+                    "as the reply, and can consume all of it, leaving an empty answer. "
+                    "Raise LITELLM_MAX_TOKENS to 4096 or more.",
+                    effort, settings.litellm_max_tokens)
+
     kwargs: dict[str, Any] = {
         "id": settings.litellm_model,
         "temperature": settings.litellm_temperature,
