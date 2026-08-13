@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import logging
 import threading
 from typing import Any, AsyncIterator
@@ -37,6 +38,7 @@ from pydantic import BaseModel  # noqa: E402
 
 from .agent import build_agent  # noqa: E402
 from .openalgo.client import get_client  # noqa: E402
+from .openalgo.normalize import sanitize_text  # noqa: E402
 from .safety.audit import get_audit_log  # noqa: E402
 
 log = logging.getLogger("app")
@@ -103,6 +105,32 @@ class ConfirmRequest(BaseModel):
     decisions: dict[str, bool]
     notes: dict[str, str] | None = None
     reasoning_effort: str | None = None
+
+
+# A model can claim to have placed an order without calling the tool. Measured on
+# gpt-5.6-luna: 5 of 6 order instructions reached the confirmation gate, and the sixth
+# answered "Placing the following order in analyzer mode" having called nothing.
+#
+# This is not a safety hole - nothing can reach the broker except through a gated tool -
+# but it is a HONESTY hole, and the more dangerous direction of the two to leave alone,
+# because the user walks away believing they have a position they do not have. The
+# stream therefore carries an explicit correction when the claim and the tool calls
+# disagree.
+_ORDER_CLAIM_RE = re.compile(
+    r"\b(plac(?:ing|ed)|submitt(?:ing|ed)|execut(?:ing|ed)|sent)\b[^.]{0,60}\border\b"
+    r"|\border\b[^.]{0,40}\b(placed|submitted|executed|filled|sent)\b",
+    re.IGNORECASE,
+)
+_MUTATING_TOOLS = _ORDER_TOOLS | {
+    "cancel_order", "cancel_all_orders", "close_all_positions", "manage_gtt_order",
+}
+
+
+def _unbacked_order_claim(text: str, tools_called: set[str]) -> bool:
+    """True when the reply claims an order happened but no order tool ran."""
+    if tools_called & _MUTATING_TOOLS:
+        return False
+    return bool(_ORDER_CLAIM_RE.search(text or ""))
 
 
 def sse(event: str, data: dict[str, Any]) -> str:
@@ -202,6 +230,8 @@ async def _pump(stream, request: Request, on_complete=None) -> AsyncIterator[str
     terminal = False
     paused = False
     errored_tools: set[str] = set()
+    tools_called: set[str] = set()
+    said: list[str] = []
 
     try:
         async for ev in stream:
@@ -226,10 +256,15 @@ async def _pump(stream, request: Request, on_complete=None) -> AsyncIterator[str
             elif name == "RunContent":
                 text = getattr(ev, "content", None)
                 if isinstance(text, str) and text:
-                    yield sse("token", {"delta": text})
+                    # Normalised per delta rather than trusted to the prompt. Each delta
+                    # is already a decoded str, so no codepoint can be split across two.
+                    clean = sanitize_text(text)
+                    said.append(clean)
+                    yield sse("token", {"delta": clean})
 
             elif name == "ToolCallStarted":
                 t = ev.tool
+                tools_called.add(t.tool_name)
                 yield sse("tool_start", {"id": t.tool_call_id, "name": t.tool_name,
                                          "args": t.tool_args})
 
@@ -290,6 +325,15 @@ async def _pump(stream, request: Request, on_complete=None) -> AsyncIterator[str
                 sid = getattr(ev, "session_id", None)
                 if on_complete and sid:
                     on_complete(sid)
+                if _unbacked_order_claim("".join(said), tools_called):
+                    log.warning("model claimed an order without calling an order tool")
+                    yield sse("notice", {
+                        "level": "warning",
+                        "message": "No order was placed. The reply above describes an "
+                                   "order, but no order tool was called, so nothing was "
+                                   "sent to the broker and you were never asked to "
+                                   "approve anything. Ask again to place it.",
+                    })
                 yield sse("done", {"reason": "stop", "session_id": sid,
                                    "run_id": getattr(ev, "run_id", None)})
 

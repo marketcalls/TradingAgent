@@ -49,9 +49,19 @@ from .tools.system import SystemTools
 
 log = logging.getLogger(__name__)
 
+# The order rule lives in the DESCRIPTION as well as the instructions because position
+# matters. Agno puts the description at the very top of the system message, and a rule
+# buried tenth in a list of twenty is followed only most of the time: gpt-5.6-luna was
+# measured pausing on 2 of 3 order requests and writing an order table in prose on the
+# third. Prose instead of a tool call means the user never sees an approval card, which
+# looks exactly like a broken confirmation gate.
 DESCRIPTION = (
     "You are a trading assistant operating a live OpenAlgo brokerage connection for "
-    "Indian markets."
+    "Indian markets. When the user tells you to place, modify or cancel an order, you "
+    "CALL the matching tool. You never write out an order as a table or a proposal and "
+    "stop there: the interface, not your reply, is what asks the user to approve it, and "
+    "nothing reaches the broker until they do. Describing an order instead of calling "
+    "the tool means the user is never asked at all."
 )
 
 INSTRUCTIONS = [
@@ -360,11 +370,29 @@ LEAN_INSTRUCTIONS = [
 ]
 
 
+# When trading is off the order tools are not registered at all, so the model discovers
+# it has no way to place an order and has to guess why. Telling it the actual reason
+# turns an unhelpful "I don't seem to have that tool" into an answer the user can act on.
+TRADING_DISABLED_NOTE = (
+    "Order placement is switched off in this deployment: TRADING_ENABLED is false in the "
+    "server environment, so no order tool is loaded and nothing you do can place, modify "
+    "or cancel an order. This is a deliberate safety setting, not a fault and not "
+    "something you can work around. You can still quote, analyse, compute indicators and "
+    "size a trade. If the user asks you to place an order, prepare the full order "
+    "details, then say plainly that order placement is disabled and that an operator must "
+    "set TRADING_ENABLED=true and restart the backend to enable it."
+)
+
+
 def build_agent(settings: Settings | None = None) -> Agent:
     settings = settings or get_settings()
     lean = settings.effective_tool_profile == "lean"
     if lean:
         log.info("lean tool profile active for %s", settings.litellm_model)
+
+    instructions = list(LEAN_INSTRUCTIONS if lean else INSTRUCTIONS)
+    if not settings.trading_enabled:
+        instructions.append(TRADING_DISABLED_NOTE)
 
     return Agent(
         id="openalgo-trading-agent",
@@ -376,7 +404,7 @@ def build_agent(settings: Settings | None = None) -> Agent:
         tools=build_tool_factory(settings),
         cache_callables=False,
         description=DESCRIPTION,
-        instructions=LEAN_INSTRUCTIONS if lean else INSTRUCTIONS,
+        instructions=instructions,
         expected_output=(
             "A direct answer. Tables for anything with more than one row. State the "
             "analyzer mode whenever an order is involved."

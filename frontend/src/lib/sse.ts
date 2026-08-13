@@ -88,6 +88,14 @@ export interface ErrorEvent {
   kind?: string | null
 }
 
+/** A server-side correction, emitted when the reply and the tool calls disagree - for
+ *  instance the model describing an order it never actually placed. */
+export interface NoticeEvent {
+  type: "notice"
+  level: "warning" | "info"
+  message: string
+}
+
 export type StreamEvent =
   | StartEvent
   | TokenEvent
@@ -96,6 +104,7 @@ export type StreamEvent =
   | ConfirmEvent
   | DoneEvent
   | ErrorEvent
+  | NoticeEvent
 
 /** One tool call as the timeline accumulates it: opened by tool_start, closed by
  *  tool_end. A call with ok still undefined is still running. */
@@ -124,6 +133,8 @@ export interface ChatMessage {
   tools?: ToolCall[]
   error?: string
   confirm?: ConfirmState
+  /** Server-side corrections about this turn, shown under the answer. */
+  notices?: { level: string; message: string }[]
 }
 
 export interface ChatStreamBody {

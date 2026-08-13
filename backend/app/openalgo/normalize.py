@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any
 
 MAX_TOOL_CHARS = 12_000
@@ -143,3 +144,52 @@ def _isnan(v: Any) -> bool:
         return math.isnan(float(v))
     except (TypeError, ValueError):
         return False
+
+
+# --- Output hygiene ---------------------------------------------------------
+#
+# Model output goes straight into the chat, so it is normalised on the way out rather
+# than merely discouraged in the prompt. Instructions are layer 1 and unreliable; this
+# is deterministic. Three things get cleaned:
+#
+#   - typographic dashes and quotes, which look wrong in a plain terminal-styled UI and
+#     are impossible to type back into a search box,
+#   - emoji and pictographs, which the project bans everywhere,
+#   - CJK characters, which for an Indian trading agent only ever appear as a defect.
+#
+# Currency symbols, accents and the rupee sign are deliberately left alone.
+
+_PUNCTUATION_MAP = {
+    "—": "-",   # em dash
+    "–": "-",   # en dash
+    "‒": "-",   # figure dash
+    "―": "-",   # horizontal bar
+    "−": "-",   # minus sign
+    "‘": "'", "’": "'", "‚": "'", "‛": "'",
+    "“": '"', "”": '"', "„": '"', "‟": '"',
+    "…": "...",
+    " ": " ",   # non-breaking space
+    " ": " ", " ": " ", "​": "",
+}
+_PUNCTUATION_RE = re.compile("|".join(map(re.escape, _PUNCTUATION_MAP)))
+
+_STRIP_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"   # emoji, pictographs, symbols
+    "\U0001F000-\U0001F2FF"
+    "☀-➿"           # misc symbols and dingbats
+    "️⃣"            # variation selector, keycap
+    "　-〿"           # CJK punctuation
+    "一-鿿"           # CJK unified ideographs
+    "぀-ヿ"           # hiragana, katakana
+    "가-힯"           # hangul
+    "]+"
+)
+
+
+def sanitize_text(text: str) -> str:
+    """Normalise a chunk of model output. Safe to call per streaming delta."""
+    if not text:
+        return text
+    cleaned = _PUNCTUATION_RE.sub(lambda m: _PUNCTUATION_MAP[m.group()], text)
+    return _STRIP_RE.sub("", cleaned)

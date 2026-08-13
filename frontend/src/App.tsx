@@ -225,6 +225,15 @@ export default function App() {
         case "error":
           patchLast((message) => ({ ...message, error: event.message || "the run failed" }))
           break
+        case "notice":
+          // A server-side correction about this turn, for instance that the reply
+          // described an order which was never actually placed.
+          patchLast((message) => ({
+            ...message,
+            notices: [...(message.notices ?? []),
+                      { level: event.level, message: event.message }],
+          }))
+          break
       }
     },
     [adoptSession, patchLast]

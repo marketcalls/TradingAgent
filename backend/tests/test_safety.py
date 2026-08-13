@@ -270,6 +270,74 @@ def test_audit(tmp: Path) -> None:
         check("audit failure is swallowed", False, f"{type(exc).__name__}: {exc}")
 
 
+# Every tool that can move money must require human confirmation. This is asserted at
+# the AGENT level, on the toolset the model is actually handed, because that is what
+# matters: a tool can be gated inside its toolkit and still reach the model ungated if
+# the assembly changes. agno only WARNS on a typo in requires_confirmation_tools, so
+# nothing else would catch a silent regression here.
+MUST_BE_GATED = [
+    "place_order", "place_smart_order", "place_basket_order", "place_split_order",
+    "place_options_order", "place_options_multi_order",
+    "place_gtt_order", "manage_gtt_order",
+    "modify_order", "cancel_order", "cancel_all_orders", "close_all_positions",
+    "set_analyzer_mode",
+]
+MUST_NOT_BE_GATED = [
+    "get_order_status", "get_quote", "get_funds", "get_positionbook", "get_holdings",
+    "get_option_chain", "resolve_option_symbol", "compute_indicator",
+]
+
+
+def test_agent_level_gating() -> None:
+    print("\n=== HITL gating on the assembled agent ===")
+    from app.config import Settings
+    from app.agent import build_tool_factory
+
+    class Ctx:
+        session_state = {"trading_enabled": True}
+
+    settings = Settings.load()
+    settings.trading_enabled = True
+    settings.tool_profile = "full"
+    fns = {f.name: f for kit in build_tool_factory(settings)(Ctx())
+           for f in kit.functions.values()}
+
+    missing = [n for n in MUST_BE_GATED if n not in fns]
+    check("every mutating tool is present", not missing, str(missing) if missing else
+          f"{len(MUST_BE_GATED)} tools")
+
+    ungated = [n for n in MUST_BE_GATED
+               if n in fns and not getattr(fns[n], "requires_confirmation", False)]
+    check("every mutating tool requires confirmation", not ungated,
+          f"UNGATED: {ungated}" if ungated else f"{len(MUST_BE_GATED)} gated")
+
+    wrongly_gated = [n for n in MUST_NOT_BE_GATED
+                     if n in fns and getattr(fns[n], "requires_confirmation", False)]
+    check("read-only tools are not gated", not wrongly_gated, str(wrongly_gated))
+
+    # Anything gated that we did not intend is also a defect worth seeing.
+    unexpected = [n for n, f in fns.items()
+                  if getattr(f, "requires_confirmation", False) and n not in MUST_BE_GATED]
+    check("no unexpected tool is gated", not unexpected, str(unexpected))
+
+    # A read-only session must not even contain an order tool.
+    ro = Settings.load()
+    ro.trading_enabled = False
+    ro_names = {f.name for kit in build_tool_factory(ro)(Ctx())
+                for f in kit.functions.values()}
+    leaked = [n for n in MUST_BE_GATED if n in ro_names and n != "set_analyzer_mode"]
+    check("no order tool exists when trading is disabled", not leaked, str(leaked))
+
+    # Price-type variants are parameters, not separate tools: SL and SL-M need a
+    # trigger price, so the argument must exist on every order-entry tool.
+    import inspect
+    no_trigger = [n for n in ("place_order", "place_smart_order", "place_split_order",
+                              "modify_order")
+                  if n in fns and "trigger_price" not in
+                  inspect.signature(fns[n].entrypoint).parameters]
+    check("SL and SL-M are supported via trigger_price", not no_trigger, str(no_trigger))
+
+
 def main() -> int:
     print("Safety layer tests")
     # ignore_cleanup_errors: on Windows sqlite keeps a handle on test.db past the last
@@ -278,6 +346,7 @@ def main() -> int:
         tmp = Path(td)
         test_risk(tmp)
         test_audit(tmp)
+    test_agent_level_gating()
 
     n_pass = sum(1 for _, s in results if s == PASS)
     n_fail = sum(1 for _, s in results if s == FAIL)

@@ -45,6 +45,14 @@ export default function Message({ message, streaming, thinking = false }: Messag
           <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
         </div>
       ) : null}
+      {(message.notices ?? []).map((notice, i) => (
+        <div
+          key={i}
+          className="mt-3 rounded-xl border border-warn-border bg-warn-soft px-3 py-2 text-sm text-warn"
+        >
+          {notice.message}
+        </div>
+      ))}
       {message.error ? (
         <div className="mt-3 rounded-xl border border-danger-border px-3 py-2 text-sm text-danger">
           {message.error}
