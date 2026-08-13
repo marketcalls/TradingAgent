@@ -129,6 +129,8 @@ export interface ChatMessage {
 export interface ChatStreamBody {
   message: string
   session_id?: string | null
+  /** "" or omitted uses the server default; otherwise none|minimal|low|medium|high. */
+  reasoning_effort?: string
 }
 
 export interface ConfirmStreamBody {
@@ -136,6 +138,8 @@ export interface ConfirmStreamBody {
   session_id: string
   decisions: Record<string, boolean>
   notes: Record<string, string>
+  /** Resume with the same effort the paused leg ran under. */
+  reasoning_effort?: string
 }
 
 export interface StreamOptions {

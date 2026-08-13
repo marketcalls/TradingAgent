@@ -16,6 +16,7 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import Sidebar from "./components/Sidebar"
 import ModeBanner from "./components/ModeBanner"
+import ThinkingSelector from "./components/ThinkingSelector"
 import Message from "./components/Message"
 import ConfirmCard from "./components/ConfirmCard"
 import Composer from "./components/Composer"
@@ -28,8 +29,7 @@ import {
   listSessions,
   type ModeInfo,
   type SessionRow,
-  type TradingMode
-} from "./lib/api"
+  type TradingMode, type ReasoningInfo } from "./lib/api"
 import {
   isAbortError,
   streamChat,
@@ -60,6 +60,12 @@ export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [running, setRunning] = useState(false)
   const [mode, setMode] = useState<TradingMode>("unknown")
+  const [reasoning, setReasoning] = useState<ReasoningInfo | null>(null)
+  // Thinking defaults to off. The server's own default is adopted only when the model
+  // cannot be silenced, so the stored preference never asks for something impossible.
+  const [effort, setEffort] = useState<string>(
+    () => localStorage.getItem("oa-thinking") ?? "none"
+  )
   const [model, setModel] = useState<string | null>(null)
   const [health, setHealth] = useState<string | null>(null)
   const [theme, setTheme] = useState<Theme>(readTheme)
@@ -134,7 +140,30 @@ export default function App() {
     container.scrollTo({ top: last.offsetTop - container.offsetTop - 16, behavior: "smooth" })
   }, [messages.length])
 
-  const onMode = useCallback((info: ModeInfo) => setMode(info.mode), [])
+  const onMode = useCallback((info: ModeInfo) => {
+    setMode(info.mode)
+    setReasoning(info.reasoning)
+    // A stored preference can be impossible for the current model, for instance "none"
+    // on a model that always reasons. Fall back to the server default in that case.
+    const supported = info.reasoning?.supported ?? []
+    if (supported.length > 0) {
+      setEffort((current) =>
+        supported.includes(current) ? current : info.reasoning?.current || supported[0]
+      )
+    }
+  }, [])
+
+  useEffect(() => {
+    localStorage.setItem("oa-thinking", effort)
+  }, [effort])
+
+  // Only claim the model is thinking when it can AND the user has not switched it off.
+  const thinkingActive = Boolean(reasoning?.modelThinks) && effort !== "none"
+
+  const effortRef = useRef(effort)
+  useEffect(() => {
+    effortRef.current = effort
+  }, [effort])
 
   const handleEvent = useCallback(
     (event: StreamEvent) => {
@@ -202,7 +231,11 @@ export default function App() {
       abortRef.current = controller
       try {
         await streamChat(
-          { message: trimmed, session_id: sessionIdRef.current },
+          {
+            message: trimmed,
+            session_id: sessionIdRef.current,
+            reasoning_effort: effortRef.current,
+          },
           { signal: controller.signal, onEvent: handleEvent }
         )
       } catch (error) {
@@ -244,7 +277,8 @@ export default function App() {
             run_id: state.runId,
             session_id: state.sessionId,
             decisions,
-            notes
+            notes,
+            reasoning_effort: effortRef.current,
           },
           { signal: controller.signal, onEvent: handleEvent }
         )
@@ -326,6 +360,14 @@ export default function App() {
         <header className="flex items-center gap-3 border-b border-border px-4 py-2">
           <ModeBanner onMode={onMode} />
           {health ? <span className="truncate text-xs text-danger">{health}</span> : null}
+          <div className="ml-auto">
+            <ThinkingSelector
+              reasoning={reasoning}
+              value={effort}
+              onChange={setEffort}
+              disabled={running}
+            />
+          </div>
         </header>
 
         <div ref={scrollRef} className="scroll-thin min-h-0 flex-1 overflow-y-auto">
@@ -353,7 +395,11 @@ export default function App() {
             ) : (
               messages.map((message, index) => (
                 <div key={index}>
-                  <Message message={message} streaming={running && index === lastIndex} />
+                  <Message
+                    message={message}
+                    streaming={running && index === lastIndex}
+                    thinking={thinkingActive}
+                  />
                   {message.confirm ? (
                     <ConfirmCard
                       state={message.confirm}

@@ -168,6 +168,97 @@ def patch_ollama_tool_call_roundtrip() -> bool:
     return True
 
 
+# Models whose real behaviour was MEASURED here and disagrees with LiteLLM's table.
+# Keyed by a substring of the model id. Keep this short and evidence-based.
+_MEASURED_REASONING: dict[str, dict] = {
+    # litellm.supports_reasoning() returns False for this, but it demonstrably reasons:
+    # reasoning_content comes back populated and usage reports reasoning_tokens
+    # (202 at default effort, 1283 at low, 1498 at high). "none" does not disable it.
+    "deepseek-v4-flash": {"thinks": True, "graded": True, "can_disable": False,
+                          "note": "Measured: this model always reasons. Effort scales the "
+                                  "budget but cannot switch it off. A higher effort needs "
+                                  "a higher max_tokens or the reply can come back empty."},
+}
+
+
+def _measured_override(model_id: str) -> dict | None:
+    lowered = model_id.lower()
+    for needle, data in _MEASURED_REASONING.items():
+        if needle in lowered:
+            return data
+    return None
+
+
+def detect_reasoning_support(model_id: str, api_base: str | None = None) -> dict:
+    """Work out whether THIS model can think, and how much control it offers.
+
+    Detection is dynamic, not a provider table, because it varies per model within a
+    provider: openai/gpt-4o cannot reason while openai/o3 can, and the UI should offer
+    no thinking control at all for the former.
+
+    Sources, in order:
+      1. Ollama - ask the server. /api/show lists a capabilities array, and "thinking"
+         appears only on models that support it. Authoritative and always current.
+      2. A short table of models measured directly in this project, where LiteLLM's
+         metadata is wrong.
+      3. litellm.supports_reasoning(), plus whether reasoning_effort appears in
+         get_supported_openai_params, which distinguishes a graded control from an
+         on/off one.
+    """
+    provider = model_id.split("/", 1)[0].lower() if "/" in model_id else ""
+
+    if provider in ("ollama", "ollama_chat"):
+        tag = model_id.split("/", 1)[1]
+        caps = ollama_model_capabilities(tag, api_base)
+        if not caps:
+            return {"thinks": False, "graded": False, "can_disable": False,
+                    "verified": False, "detected_by": "ollama (unreachable)",
+                    "note": f"Could not reach Ollama to ask what {tag} supports."}
+        thinks = "thinking" in caps
+        return {
+            "thinks": thinks,
+            # LiteLLM maps reasoning_effort onto Ollama's boolean `think` flag.
+            "graded": False,
+            "can_disable": thinks,
+            "verified": True,
+            "detected_by": "ollama /api/show",
+            "note": ("Ollama exposes thinking as on or off, with no gradation."
+                     if thinks else
+                     f"{tag} does not report a thinking capability, so there is nothing "
+                     "to control."),
+        }
+
+    measured = _measured_override(model_id)
+    if measured:
+        return {**measured, "verified": True, "detected_by": "measured in this project"}
+
+    try:
+        import litellm
+        thinks = bool(litellm.supports_reasoning(model=model_id))
+        graded = False
+        if thinks:
+            try:
+                params = litellm.get_supported_openai_params(model=model_id) or []
+                graded = "reasoning_effort" in params
+            except Exception:  # noqa: BLE001
+                graded = False
+        return {
+            "thinks": thinks,
+            "graded": graded,
+            "can_disable": graded,
+            "verified": False,
+            "detected_by": "litellm.supports_reasoning",
+            "note": ("" if thinks else
+                     f"{model_id} is not a reasoning model, so there is no thinking to "
+                     "control."),
+        }
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not detect reasoning support for %s: %s", model_id, exc)
+        return {"thinks": False, "graded": False, "can_disable": False,
+                "verified": False, "detected_by": "unavailable",
+                "note": "Could not determine whether this model reasons."}
+
+
 def prepare_provider(model_id: str, api_base: str | None = None) -> None:
     """Apply any provider-specific corrections needed before building the model."""
     if model_id.startswith(("ollama/", "ollama_chat/")):

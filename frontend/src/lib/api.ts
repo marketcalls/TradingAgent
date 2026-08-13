@@ -9,12 +9,33 @@
 
 export type TradingMode = "analyze" | "live" | "unknown"
 
+/** What thinking control the configured model actually offers.
+ *
+ * Detected per model by the backend, not per provider: openai/gpt-4o cannot reason
+ * while openai/o3 can. When `modelThinks` is false there is nothing to control and the
+ * UI shows no selector at all.
+ */
+export interface ReasoningInfo {
+  modelThinks: boolean
+  /** Effort values worth offering. Empty when the model cannot reason. */
+  supported: string[]
+  labels: Record<string, string>
+  canDisable: boolean
+  graded: boolean
+  detectedBy: string
+  note: string
+  /** The server-side default, used until the user picks something. */
+  current: string
+}
+
 export interface ModeInfo {
   mode: TradingMode
   broker: string | null
   note: string | null
   /** False when the backend or the broker connection could not be reached. */
   reachable: boolean
+  model: string | null
+  reasoning: ReasoningInfo | null
 }
 
 export interface HealthInfo {
@@ -126,7 +147,29 @@ export function normalizeMode(payload: unknown): ModeInfo {
   const ok = root?.ok
   const status = root?.status
   const reachable = ok === false || status === "error" ? false : mode !== "unknown"
-  return { mode, broker, note, reachable }
+
+  let reasoning: ReasoningInfo | null = null
+  let model: string | null = null
+  const rawReasoning = sources.map((entry) => entry.reasoning).find(Boolean)
+  for (const entry of sources) {
+    if (!model && typeof entry.model === "string" && entry.model.trim()) model = entry.model
+  }
+  if (rawReasoning && typeof rawReasoning === "object") {
+    const r = rawReasoning as Record<string, unknown>
+    const supported = Array.isArray(r.supported) ? (r.supported as string[]) : []
+    reasoning = {
+      modelThinks: r.model_thinks === true && supported.length > 0,
+      supported,
+      labels: (r.labels as Record<string, string>) ?? {},
+      canDisable: r.can_disable === true,
+      graded: r.graded === true,
+      detectedBy: typeof r.detected_by === "string" ? r.detected_by : "",
+      note: typeof r.note === "string" ? r.note : "",
+      current: typeof r.current === "string" ? r.current : "",
+    }
+  }
+
+  return { mode, broker, note, reachable, model, reasoning }
 }
 
 export async function getMode(): Promise<ModeInfo> {
@@ -134,7 +177,10 @@ export async function getMode(): Promise<ModeInfo> {
     const payload = await request<unknown>("/api/mode")
     return normalizeMode(payload)
   } catch (error) {
-    return { mode: "unknown", broker: null, note: describeError(error), reachable: false }
+    return {
+      mode: "unknown", broker: null, note: describeError(error), reachable: false,
+      model: null, reasoning: null,
+    }
   }
 }
 

@@ -2,9 +2,10 @@
  *
  * User turns get a bubble, assistant turns do not: the answer is the page, not a
  * card on it. Assistant markdown goes through remark-gfm because most trading
- * answers are tables. While the first token is still on its way the word Thinking
- * shimmers in place of the answer, which for this model is about 1.7 seconds of
- * reasoning before any content arrives.
+ * answers are tables. While the first token is still on its way a shimmering label
+ * stands in for the answer. It only says Thinking when the model is genuinely
+ * reasoning: a non-reasoning model, or one with thinking switched off, says Working
+ * instead, because claiming otherwise would be a lie about what is happening.
  */
 
 import ReactMarkdown from "react-markdown"
@@ -16,9 +17,11 @@ interface MessageProps {
   message: ChatMessage
   /** True only for the last assistant turn while its run is still open. */
   streaming: boolean
+  /** True when this model reasons AND thinking is currently enabled. */
+  thinking?: boolean
 }
 
-export default function Message({ message, streaming }: MessageProps) {
+export default function Message({ message, streaming, thinking = false }: MessageProps) {
   if (message.role === "user") {
     return (
       <div className="mb-6 flex justify-end" data-user-msg>
@@ -36,7 +39,7 @@ export default function Message({ message, streaming }: MessageProps) {
     <div className="mb-6 pr-10">
       <ToolTimeline tools={tools} running={streaming} />
       {waiting ? (
-        <span className="shimmer text-base">Thinking</span>
+        <span className="shimmer text-base">{thinking ? "Thinking" : "Working"}</span>
       ) : message.content ? (
         <div className="md text-base">
           <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>

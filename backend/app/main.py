@@ -18,8 +18,10 @@ Streaming facts verified against agno 2.8.7:
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
+import threading
 from typing import Any, AsyncIterator
 
 from .config import get_settings, setup_logging
@@ -42,6 +44,31 @@ log = logging.getLogger("app")
 settings = get_settings()
 agent = build_agent(settings)
 client = get_client()
+
+# One Agent per reasoning-effort level, built on demand. They all share the same
+# SqliteDb file, so a session (and a paused run) is readable from any of them and the
+# user can change the setting mid-conversation without losing history.
+_agents: dict[str, Any] = {"": agent}
+_agents_lock = threading.Lock()
+
+
+def get_agent(effort: str | None = None):
+    """Return the agent for a reasoning effort. Empty or unknown means the .env default."""
+    key = (effort or "").strip().lower()
+    if key and key not in settings.REASONING_EFFORTS:
+        log.warning("ignoring unknown reasoning_effort %r from the client", key)
+        key = ""
+    if not key:
+        return agent
+    with _agents_lock:
+        built = _agents.get(key)
+        if built is None:
+            scoped = copy.copy(settings)
+            scoped.litellm_reasoning_effort = key
+            built = build_agent(scoped)
+            _agents[key] = built
+            log.info("built agent for reasoning_effort=%s", key)
+        return built
 
 app = FastAPI(title="OpenAlgo Trading Agent")
 app.add_middleware(
@@ -66,6 +93,8 @@ class ChatRequest(BaseModel):
     message: str
     session_id: str | None = None
     trading_enabled: bool | None = None
+    # "" or absent uses the .env default; otherwise none|minimal|low|medium|high.
+    reasoning_effort: str | None = None
 
 
 class ConfirmRequest(BaseModel):
@@ -73,6 +102,7 @@ class ConfirmRequest(BaseModel):
     session_id: str
     decisions: dict[str, bool]
     notes: dict[str, str] | None = None
+    reasoning_effort: str | None = None
 
 
 def sse(event: str, data: dict[str, Any]) -> str:
@@ -303,6 +333,12 @@ async def mode() -> dict[str, Any]:
         "trading_enabled": settings.trading_enabled,
         "require_analyzer_mode": settings.require_analyzer_mode,
         "kill_switch": settings.kill_switch_engaged(),
+        "model": settings.litellm_model,
+        "tool_profile": settings.effective_tool_profile,
+        # Detected per model, so the UI can hide the control entirely for something
+        # like gpt-4o that cannot reason at all.
+        "reasoning": settings.reasoning_capability(),
+        "default_reasoning_effort": settings.resolve_reasoning_effort() or "",
     }
 
 
@@ -320,7 +356,7 @@ async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
         if is_new:
             _name_session(sid, req.message)
 
-    stream = agent.arun(
+    stream = get_agent(req.reasoning_effort).arun(
         req.message,
         session_id=session_id,
         user_id=USER_ID,
@@ -373,7 +409,9 @@ async def chat_confirm(req: ConfirmRequest, request: Request) -> StreamingRespon
     if not resolved:
         raise HTTPException(400, "this run has no pending confirmations")
 
-    stream = agent.acontinue_run(
+    # Same effort as the paused leg, so the resume behaves like the run it continues.
+    # Every agent shares one SqliteDb, so the paused run is readable from any of them.
+    stream = get_agent(req.reasoning_effort).acontinue_run(
         run_id=req.run_id,
         session_id=req.session_id,
         requirements=run.requirements,

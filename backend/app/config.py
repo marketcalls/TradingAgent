@@ -216,6 +216,43 @@ class Settings:
     def thinking_disabled(self) -> bool:
         return self.resolve_reasoning_effort() == "none"
 
+    def reasoning_capability(self) -> dict:
+        """What thinking control THIS model actually offers, detected per model.
+
+        Detection is dynamic: openai/gpt-4o cannot reason while openai/o3 can, so the
+        answer depends on the exact model, not the provider. See
+        model_providers.detect_reasoning_support.
+        """
+        from .model_providers import detect_reasoning_support
+
+        found = detect_reasoning_support(self.litellm_model,
+                                         self.resolve_model_api_base())
+        current = self.resolve_reasoning_effort() or ""
+
+        if not found["thinks"]:
+            options: list[str] = []          # the UI hides the control entirely
+        elif found["graded"]:
+            options = ["none", "minimal", "low", "medium", "high"]
+            if not found["can_disable"]:
+                options.remove("none")
+        else:
+            options = ["none", "low"]        # on/off only
+
+        return {
+            "model": self.litellm_model,
+            "provider": self.model_provider or "unknown",
+            "model_thinks": found["thinks"],
+            "supported": options,
+            "labels": {"none": "Off", "minimal": "Minimal", "low": "Low" if found["graded"]
+                       else "On", "medium": "Medium", "high": "High"},
+            "can_disable": found["can_disable"],
+            "graded": found["graded"],
+            "verified": found["verified"],
+            "detected_by": found["detected_by"],
+            "current": current,
+            "note": found.get("note", ""),
+        }
+
     @property
     def effective_tool_profile(self) -> str:
         """'lean' or 'full'.

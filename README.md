@@ -183,8 +183,19 @@ Set `TOOL_PROFILE=full` to override, at the cost of reliability on a small model
 
 ### Thinking / reasoning effort
 
-`LITELLM_REASONING_EFFORT` controls how much the model thinks before answering. Empty leaves the
-provider default alone; otherwise `none | minimal | low | medium | high`.
+`LITELLM_REASONING_EFFORT` sets the default; **the user can also change it per message from the
+header**, and the choice is remembered. Thinking is **off by default**.
+
+The control is built from what the model actually supports, detected per model rather than per
+provider - so `openai/gpt-4o` shows **no control at all**, while `openai/o3` gets the full scale.
+Detection asks Ollama's `/api/show` for local models and `litellm.supports_reasoning()` for
+hosted ones, with a short table of models measured directly here where LiteLLM's metadata is
+wrong (Baseten's DeepSeek V4 Flash reports `supports_reasoning=False` but demonstrably reasons).
+
+The waiting indicator follows the same truth: it says **Thinking** only when the model really is
+reasoning, and **Working** otherwise.
+
+Values: `none | minimal | low | medium | high`; empty leaves the provider default alone.
 
 **It behaves differently per provider, so measure rather than assume:**
 
