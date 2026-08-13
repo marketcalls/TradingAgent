@@ -14,3 +14,13 @@ numpy>=2.5.2
 sqlalchemy>=2.0.52
 python-dotenv>=1.2.2
 pydantic>=2.13.4
+
+# Transitive dependencies with published advisories, floored to the fixed releases.
+# pip resolves these anyway; pinning the floor means a fresh install cannot land on a
+# vulnerable one. Re-check with:  python -m pip_audit -r backend/requirements.txt
+requests>=2.33.0
+urllib3>=2.7.0
+idna>=3.15
+click>=8.3.3
+filelock>=3.20.3
+pygments>=2.20.0
