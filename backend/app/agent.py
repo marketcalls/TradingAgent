@@ -64,6 +64,24 @@ DESCRIPTION = (
     "the tool means the user is never asked at all."
 )
 
+# The chart rules, shared by the full and lean prompts. The chart toolkit is
+# scoped per run, so whichever prompt is active has to carry these.
+CHART_INSTRUCTIONS = [
+    "When a chart is open you are a technical analyst working on it. Its symbol, "
+    "exchange, interval and visible range are given to you: never ask the user which "
+    "instrument or timeframe they mean, and never make them repeat it.",
+    "You do not decide where a line goes. The drawing tools compute the geometry from "
+    "the bars and hand back exact anchors; you choose what to draw and describe what "
+    "came back. Never write a swing high, a level or a target you did not get from a "
+    "tool.",
+    "Name the instrument and timeframe back in your answer, and quote the anchor prices "
+    "the tool returned. That is how the user catches an answer about the wrong chart.",
+    "Keep a markup reply to a short heading and two or three labelled lines. It is a "
+    "caption for something the user can already see, not an essay.",
+    "A setting written as two numbers can be ambiguous. Apply the usual convention, "
+    "then say which reading you used so a wrong guess costs one short correction.",
+]
+
 INSTRUCTIONS = [
     # symbology
     "Symbols follow OpenAlgo's format. Equity is the bare base symbol (RELIANCE, SBIN). "
@@ -130,20 +148,7 @@ INSTRUCTIONS = [
     "If a tool returns no data, say so plainly. Never invent a price, a position, or an "
     "order id.",
 
-    # the chart, when one is open
-    "When a chart is open you are a technical analyst working on it. Its symbol, "
-    "exchange, interval and visible range are given to you: never ask the user which "
-    "instrument or timeframe they mean, and never make them repeat it.",
-    "You do not decide where a line goes. The drawing tools compute the geometry from "
-    "the bars and hand back exact anchors; you choose what to draw and describe what "
-    "came back. Never write a swing high, a level or a target you did not get from a "
-    "tool.",
-    "Name the instrument and timeframe back in your answer, and quote the anchor prices "
-    "the tool returned. That is how the user catches an answer about the wrong chart.",
-    "Keep a markup reply to a short heading and two or three labelled lines. It is a "
-    "caption for something the user can already see, not an essay.",
-    "A setting written as two numbers can be ambiguous. Apply the usual convention, "
-    "then say which reading you used so a wrong guess costs one short correction.",
+    *CHART_INSTRUCTIONS,
 
     # boundary
     "You carry out instructions and provide analysis. You do not give personalised "
@@ -268,6 +273,14 @@ def build_tool_factory(settings: Settings):
             chart = _chart_toolkit()
             if chart is not None:
                 kits.append(chart)
+            # The charts page is read-only, and that has to be true at THIS layer,
+            # not just in the prompt. Order tools were being registered here
+            # because the page never sends trading_enabled and so inherited the
+            # environment default. A model that then called place_order would
+            # pause the run for an approval the charts panel cannot give, and
+            # the run sat paused forever. With no order tool in the schema there
+            # is nothing to pause on.
+            return kits
         session_allows = bool(state.get("trading_enabled", settings.trading_enabled))
         if settings.trading_enabled and session_allows:
             kits.extend(_order_toolkits(lean=lean))
@@ -427,6 +440,11 @@ def build_agent(settings: Settings | None = None) -> Agent:
         log.info("lean tool profile active for %s", settings.litellm_model)
 
     instructions = list(LEAN_INSTRUCTIONS if lean else INSTRUCTIONS)
+    if lean:
+        # The chart toolkit is scoped per run, so the lean prompt has to carry
+        # the chart rules as well or a chart turn on a small model is told to act
+        # only on a named instrument and refuses to draw.
+        instructions.extend(CHART_INSTRUCTIONS)
     if not settings.trading_enabled:
         instructions.append(TRADING_DISABLED_NOTE)
 

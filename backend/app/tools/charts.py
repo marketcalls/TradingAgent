@@ -747,105 +747,26 @@ def _restore_envelope(record: dict) -> dict[str, Any]:
     }
 
 
-def _line_at(fit: dict[str, Any], t0: float, t1: float) -> tuple[Anchor, Anchor]:
-    """Evaluate a fitted line at two times.
+def _rail_sentence(name: str, rail: dict[str, Any], what: str) -> str:
+    """One sentence describing a rail by the numbers the fit returned.
 
     Args:
-        fit: A result from :func:`geometry.fit_trendline`.
-        t0: Left edge, UTC seconds.
-        t1: Right edge, UTC seconds.
+        name: "Upper rail" or "Lower rail".
+        rail: One side of a :func:`geometry.fit_channel` result.
+        what: "swing highs" or "swing lows".
 
     Returns:
-        The two anchors the line passes through at those times.
+        The sentence, naming both anchors, the touches, and any bars that cross
+        the rail. A crossing is reported rather than hidden: a rail that price
+        has already broken is information, and pretending otherwise is how a
+        drawing lies.
     """
-    slope = float(fit.get("slope") or 0.0)
-    intercept = float(fit.get("intercept") or 0.0)
-    return (Anchor(time=t0, price=slope * t0 + intercept),
-            Anchor(time=t1, price=slope * t1 + intercept))
-
-
-def _channel_rails(upper_fit: dict[str, Any], lower_fit: dict[str, Any],
-                   highs: list, lows: list, t0: float, t1: float,
-                   df: Any) -> tuple[tuple[Anchor, Anchor], tuple[Anchor, Anchor]]:
-    """Two sane rails for a channel, falling back to parallel when a fit runs away.
-
-    Each side is fitted only to its own pivots, so projecting it across the union
-    of both sides extrapolates it beyond any evidence. When one side's pivots are
-    bunched into part of the window that extrapolation is violent: a lower rail
-    fitted to a late cluster of rising lows was drawn at 1198 on a chart whose
-    lowest bar was 1267, and the two rails crossed.
-
-    So the independent fits are used only if they survive two checks: the rails
-    must not cross inside the span, and neither may leave the data's own range by
-    more than the height of that range. Anything else falls back to a parallel
-    channel built on the better supported slope, which cannot cross by
-    construction and always brackets the bars.
-
-    Args:
-        upper_fit: Fit over the swing highs.
-        lower_fit: Fit over the swing lows.
-        highs: The swing high pivots.
-        lows: The swing low pivots.
-        t0: Left edge, UTC seconds.
-        t1: Right edge, UTC seconds.
-        df: The candle frame, for the data's real high and low.
-
-    Returns:
-        The upper rail's two anchors and the lower rail's two anchors.
-    """
-    upper = _line_at(upper_fit, t0, t1)
-    lower = _line_at(lower_fit, t0, t1)
-
-    low = float(df["low"].min())
-    high = float(df["high"].max())
-    span = max(high - low, 1e-9)
-    floor, ceiling = low - span, high + span
-
-    crosses = upper[0].price <= lower[0].price or upper[1].price <= lower[1].price
-    runaway = any(not (floor <= a.price <= ceiling) for a in (*upper, *lower))
-    if not crosses and not runaway:
-        return upper, lower
-
-    # Parallel fallback. The slope comes from whichever side more pivots agreed
-    # on, because that is the side whose trend is actually evidenced.
-    if int(upper_fit.get("touches") or 0) >= int(lower_fit.get("touches") or 0):
-        slope = float(upper_fit.get("slope") or 0.0)
-    else:
-        slope = float(lower_fit.get("slope") or 0.0)
-
-    # Offset each rail so it sits on the most extreme pivot of its own side: the
-    # channel then touches the bars it claims to touch.
-    top = max(p.price - slope * p.time for p in highs)
-    bottom = min(p.price - slope * p.time for p in lows)
-    return (
-        (Anchor(time=t0, price=slope * t0 + top), Anchor(time=t1, price=slope * t1 + top)),
-        (Anchor(time=t0, price=slope * t0 + bottom), Anchor(time=t1, price=slope * t1 + bottom)),
-    )
-
-
-def _channel_shape(upper: tuple[Anchor, Anchor], lower: tuple[Anchor, Anchor]) -> str:
-    """Name a channel by what its two rails do relative to each other.
-
-    Args:
-        upper: The upper rail's left and right anchors.
-        lower: The lower rail's left and right anchors.
-
-    Returns:
-        One of "rising", "falling", "contracting", "broadening" or "sideways".
-    """
-    left = upper[0].price - lower[0].price
-    right = upper[1].price - lower[1].price
-    if left > 0 and right / left < 0.7:
-        return "contracting"
-    if left > 0 and right / left > 1.4:
-        return "broadening"
-    drift = ((upper[1].price + lower[1].price) - (upper[0].price + lower[0].price)) / 2.0
-    span = max(abs(left), abs(right), 1e-9)
-    if drift > span * 0.5:
-        return "rising"
-    if drift < -span * 0.5:
-        return "falling"
-    return "sideways"
+    text = (f"{name} {rail['from']['price']:.2f} to {rail['to']['price']:.2f} "
+            f"across {rail['touches']} {what}")
+    crossings = int(rail.get("crossings") or 0)
+    if crossings:
+        text += f", crossed by {crossings} bar{'s' if crossings != 1 else ''}"
+    return text + "."
 
 
 def _tone_for(direction: Any) -> str:
@@ -923,7 +844,12 @@ class ChartTools(Toolkit):
             The frames.get_frame envelope: {"ok": True, "frame": DataFrame} or
             {"ok": False, "error": str}.
         """
-        bars = max(60, min(int(lookback or DEFAULT_LOOKBACK), MAX_LOOKBACK))
+        # Never fetch fewer bars than the chart has loaded. A lookback smaller
+        # than the viewport clipped the window, and the same request on the same
+        # chart then answered differently depending on the number the model
+        # happened to pass.
+        wanted = max(int(lookback or DEFAULT_LOOKBACK), int(ctx.bar_count or 0))
+        bars = max(60, min(wanted, MAX_LOOKBACK))
         return await asyncio.to_thread(
             self.frames.get_frame,
             C.normalize_symbol(ctx.symbol), C.normalize_exchange(ctx.exchange),
@@ -1379,53 +1305,51 @@ class ChartTools(Toolkit):
             G.envelope, df, 3, 3, CHANNEL_PIVOTS, window_start, window_end)
         highs = list(env.get("highs") or [])
         lows = list(env.get("lows") or [])
-        if len(highs) < 2 or len(lows) < 2:
+        if len(highs) < 2 and len(lows) < 2:
             yield (f"Not enough swing structure in the last {len(df)} bars of "
                    f"{ctx.symbol} {ctx.interval} to fit a channel: it needs at least "
-                   "two swing highs and two swing lows. Try a longer lookback.")
+                   "two swing highs or two swing lows. Try a longer lookback.")
             return
 
-        # Two straight lines, each fitted to its own side, so they are free to
-        # converge or diverge. That is what makes a triangle or a wedge expressible;
-        # forcing the second rail parallel would flatten every one of them into a
-        # constant-width band that describes nothing.
-        upper_fit = await asyncio.to_thread(G.fit_trendline, highs, TREND_TOLERANCE_PCT)
-        lower_fit = await asyncio.to_thread(G.fit_trendline, lows, TREND_TOLERANCE_PCT)
-        if upper_fit.get("from") is None or lower_fit.get("from") is None:
+        # Two straight lines, each fitted to its own side and each starting at
+        # its own first anchor. fit_channel picks the pair of pivots whose line
+        # is crossed by the fewest bars over its span, so a rail actually bounds
+        # price, and it is deterministic, so the same chart draws the same lines.
+        fit = await asyncio.to_thread(
+            G.fit_channel, df, highs, lows, window_start, window_end, TREND_TOLERANCE_PCT)
+        upper = fit.get("upper")
+        lower = fit.get("lower")
+        if upper is None and lower is None:
             yield (f"Could not fit a channel through the swings on {ctx.symbol} "
                    f"{ctx.interval}. Try a longer lookback.")
             return
 
-        # Both rails are evaluated at the SAME two times. Fitted separately they
-        # each span only their own pivots, and two lines starting and stopping at
-        # different bars read as two unrelated trendlines rather than a channel.
-        edges = [p.time for p in highs] + [p.time for p in lows]
-        t0, t1 = min(edges), max(edges)
-        upper, lower = _channel_rails(upper_fit, lower_fit, highs, lows, t0, t1, df)
-
         tone = _tone_for(env.get("direction"))
         caption = label or None
-        shapes = [
-            Trendline(from_=upper[0], to=upper[1], extend_right=True,
-                      label=caption, tone=tone),
-            Trendline(from_=lower[0], to=lower[1], extend_right=True, tone=tone),
-        ]
+        shapes: list[Any] = []
+        if upper is not None:
+            shapes.append(Trendline(
+                from_=Anchor(**upper["from"]), to=Anchor(**upper["to"]),
+                extend_right=True, label=caption, tone=tone))
+        if lower is not None:
+            shapes.append(Trendline(
+                from_=Anchor(**lower["from"]), to=Anchor(**lower["to"]),
+                extend_right=True, tone=tone))
 
-        # The channel's height is measured at the right-hand edge, where a trader
-        # reads it, not as an average across a band that may be widening.
-        width = abs(upper[1].price - lower[1].price)
+        width = float(fit.get("width_right") or 0.0)
         record = _store_envelope(run_context, GROUP_ENVELOPE, ctx, env)
         record["width"] = width
+        record["shape"] = fit.get("shape")
         yield ChartCommandEvent(commands=[draw_command(GROUP_ENVELOPE, shapes)])
 
-        shape_word = _channel_shape(upper, lower)
-        yield (
-            f"Drew a {shape_word} channel on {ctx.symbol} {ctx.interval}. Upper rail "
-            f"{upper[0].price:.2f} to {upper[1].price:.2f} across "
-            f"{upper_fit['touches']} swing highs, lower rail {lower[0].price:.2f} to "
-            f"{lower[1].price:.2f} across {lower_fit['touches']} swing lows. Width at "
-            f"the right edge {_round(width)}."
-        )
+        parts = [f"Drew a {fit.get('shape', 'sideways')} channel on {ctx.symbol} {ctx.interval}."]
+        if upper is not None:
+            parts.append(_rail_sentence("Upper rail", upper, "swing highs"))
+        if lower is not None:
+            parts.append(_rail_sentence("Lower rail", lower, "swing lows"))
+        if upper is not None and lower is not None:
+            parts.append(f"Width at the right edge {_round(width)}.")
+        yield " ".join(parts)
 
     async def draw_trendline(self, from_price: float = 0.0, to_price: float = 0.0,
                              extend: bool = True, label: str = "",

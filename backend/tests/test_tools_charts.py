@@ -284,6 +284,29 @@ def test_confirmation_flags(kit: ChartTools) -> None:
     print("\n=== confirmation flags ===")
     gated = [f.name for f in kit.get_async_functions().values()
              if getattr(f, "requires_confirmation", False)]
+    # The page is read-only at the TOOL layer, not just in the prompt. A chart
+    # turn used to inherit the environment's trading_enabled and register every
+    # order tool; a model that called one paused the run for an approval the
+    # charts panel cannot give. This is the test that keeps that door shut.
+    from types import SimpleNamespace as _NS
+    from app.agent import build_tool_factory as _btf
+    from app.config import get_settings as _gs
+    _factory = _btf(_gs())
+    def _names(kits):
+        out = set()
+        for k in kits:
+            out |= set(getattr(k, "functions", {}) or {}) | set(getattr(k, "async_functions", {}) or {})
+        return out
+    _chart_turn = _names(_factory(_NS(session_state={"chart": {"symbol": "RELIANCE"}})))
+    _chat_turn = _names(_factory(_NS(session_state={})))
+    _order_names = {n for n in _chat_turn if n.startswith(("place_", "modify_", "cancel_", "close_all", "manage_gtt"))}
+    check("a chart turn registers no order tool at all",
+          len(_order_names & _chart_turn) == 0 and len(_order_names) > 0,
+          f"{len(_order_names & _chart_turn)} of {len(_order_names)} order tools reachable")
+    check("a chart turn still has the chart tools",
+          "draw_envelope" in _chart_turn and "list_chart_indicators" in _chart_turn, str(len(_chart_turn)))
+    check("a chat turn does not see the chart tools",
+          "draw_envelope" not in _chat_turn, str(len(_chat_turn)))
     check("no chart tool is confirmation gated", gated == [], str(gated))
 
     external = [f.name for f in kit.get_async_functions().values()
@@ -795,15 +818,44 @@ async def test_live(kit: ChartTools) -> None:
           not any(s.get("kind") in ("envelope", "polyline") for s in shapes),
           str([s.get("kind") for s in shapes]))
     anchors = [s[k] for s in shapes for k in ("from", "to") if k in s]
-    check("both rails span the same two times, so they read as one channel",
-          len(anchors) == 4 and anchors[0]["time"] == anchors[2]["time"]
-          and anchors[1]["time"] == anchors[3]["time"],
+    # Rails END together at the right edge so they read as one structure, but
+    # each STARTS at its own first anchor pivot. Forcing a common start was what
+    # extrapolated a support line backwards to fifty rupees above the candles.
+    check("both rails end at the same right edge",
+          len(anchors) == 4 and anchors[1]["time"] == anchors[3]["time"],
           str([a["time"] for a in anchors]))
-    check("the upper rail sits above the lower rail at both ends",
-          len(anchors) == 4 and anchors[0]["price"] > anchors[2]["price"]
-          and anchors[1]["price"] > anchors[3]["price"],
-          f"{anchors[0]['price']:.2f}/{anchors[2]['price']:.2f} then "
-          f"{anchors[1]['price']:.2f}/{anchors[3]['price']:.2f}" if len(anchors) == 4 else "")
+    check("the upper rail sits above the lower rail at the right edge",
+          len(anchors) == 4 and anchors[1]["price"] > anchors[3]["price"],
+          f"{anchors[1]['price']:.2f} over {anchors[3]['price']:.2f}" if len(anchors) == 4 else "")
+    # Containment is what a channel means. Over each rail's own span, no closed
+    # bar may sit beyond it by more than the fit tolerance.
+    from app.openalgo.frames import get_frame_cache as _gfc
+    _frame = _gfc().get_frame("RELIANCE", "NSE", "D", lookback_bars=300)["frame"]
+    import numpy as _np
+    from app.charts.geometry import to_utc_seconds as _tus
+    _t = _tus(_frame.index)
+    _hi = _frame["high"].to_numpy(dtype=float)
+    _lo = _frame["low"].to_numpy(dtype=float)
+    def _crossings(rail_from, rail_to, side):
+        slope = (rail_to["price"] - rail_from["price"]) / (rail_to["time"] - rail_from["time"])
+        line = rail_from["price"] + slope * (_t - rail_from["time"])
+        span = (_t >= rail_from["time"]) & (_t <= rail_to["time"])
+        span[-1] = False
+        slack = _np.abs(line) * 0.005
+        bad = span & ((_hi > line + slack) if side == "high" else (_lo < line - slack))
+        return int(bad.sum())
+    if len(anchors) == 4:
+        up_x = _crossings(anchors[0], anchors[1], "high")
+        lo_x = _crossings(anchors[2], anchors[3], "low")
+        check("no closed bar pokes above the upper rail over its span",
+              up_x == 0, f"{up_x} bars above")
+        check("no closed bar pokes below the lower rail over its span",
+              lo_x == 0, f"{lo_x} bars below")
+    # Determinism: the same chart must draw the same channel twice.
+    cmds2, _, _ = await drive(functions["draw_envelope"], rc, lookback=300, label="daily swing")
+    check("the same chart draws the same channel twice",
+          json.dumps(cmds, sort_keys=True) == json.dumps(cmds2, sort_keys=True),
+          "identical" if cmds == cmds2 else "DIFFERENT")
     check("every anchor is UTC seconds, not milliseconds and not a bar index",
           all(1_000_000_000 < a["time"] < 4_000_000_000 for a in anchors),
           str([a["time"] for a in anchors[:2]]))

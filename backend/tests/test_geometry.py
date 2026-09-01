@@ -799,6 +799,100 @@ def test_live() -> None:
               f"{len(clipped['highs'])}/{len(clipped['lows'])} vertices after the clip")
 
 
+def test_fit_channel() -> None:
+    """Two rails that bound price, start at their own anchors, and never move."""
+    print("\n=== fit_channel ===")
+    import numpy as np
+    import pandas as pd
+    from app.charts import geometry as G
+
+    # A descending move: lower highs and lower lows, with noise, and a spike in
+    # the forming bar that must not change the answer.
+    n = 120
+    rng = np.random.default_rng(7)
+    idx = pd.date_range("2026-01-01", periods=n, freq="h", tz="Asia/Kolkata")
+    drift = 1400 - np.arange(n) * 0.8
+    wave = 12 * np.sin(np.arange(n) / 5.0)
+    close = drift + wave + rng.normal(0, 1.0, n)
+    high = close + 3 + rng.random(n) * 2
+    low = close - 3 - rng.random(n) * 2
+    df = pd.DataFrame({"open": close, "high": high, "low": low, "close": close,
+                       "volume": 1000, "oi": 0}, index=idx)
+
+    env = G.envelope(df, 3, 3, 5)
+    highs, lows = env["highs"], env["lows"]
+    check("the synthetic move yields pivots on both sides",
+          len(highs) >= 2 and len(lows) >= 2, f"{len(highs)} highs, {len(lows)} lows")
+
+    fit = G.fit_channel(df, highs, lows, None, None, 0.5)
+    up, lo = fit["upper"], fit["lower"]
+    check("both rails are fitted", up is not None and lo is not None, str(fit["shape"]))
+    if up is None or lo is None:
+        return
+
+    t = G.to_utc_seconds(df.index)
+    hi_arr = df["high"].to_numpy(dtype=float)
+    lo_arr = df["low"].to_numpy(dtype=float)
+
+    def crossings(rail, side):
+        line = rail["slope"] * t + rail["intercept"]
+        span = (t >= rail["from"]["time"]) & (t <= rail["to"]["time"])
+        span[-1] = False
+        slack = np.abs(line) * 0.005
+        bad = span & ((hi_arr > line + slack) if side == "high" else (lo_arr < line - slack))
+        return int(bad.sum()), rail["crossings"]
+
+    up_x, up_reported = crossings(up, "high")
+    lo_x, lo_reported = crossings(lo, "low")
+    check("no closed bar crosses the upper rail over its span", up_x == 0, f"{up_x} above")
+    check("no closed bar crosses the lower rail over its span", lo_x == 0, f"{lo_x} below")
+    check("the crossing count the fit reports is the one measured",
+          up_reported == up_x and lo_reported == lo_x, f"{up_reported}/{lo_reported}")
+
+    # NO BACKWARD EXTRAPOLATION. A rail starts at a real pivot of its own side.
+    check("the upper rail starts at one of its own swing highs",
+          any(abs(up["from"]["time"] - p.time) < 1e-6 for p in highs), str(up["from"]))
+    check("the lower rail starts at one of its own swing lows",
+          any(abs(lo["from"]["time"] - p.time) < 1e-6 for p in lows), str(lo["from"]))
+    check("both rails end at the window's right edge",
+          up["to"]["time"] == lo["to"]["time"] == float(t[-1]), str(up["to"]["time"]))
+    check("the upper rail is above the lower rail at the right edge",
+          up["to"]["price"] > lo["to"]["price"],
+          f"{up['to']['price']:.2f} over {lo['to']['price']:.2f}")
+    check("a descending move is classified as falling or contracting",
+          fit["shape"] in ("falling", "contracting"), fit["shape"])
+
+    # DETERMINISM. The same frame twice, and then with the forming bar spiked,
+    # must give byte-identical rails. The forming bar is alive; a channel that
+    # changed on every tick would read as broken.
+    again = G.fit_channel(df, highs, lows, None, None, 0.5)
+    same = (again["upper"]["from"] == up["from"] and again["upper"]["to"] == up["to"]
+            and again["lower"]["from"] == lo["from"] and again["lower"]["to"] == lo["to"])
+    check("the same frame gives the same rails", same, "identical" if same else "DIFFERENT")
+
+    spiked = df.copy()
+    spiked.iloc[-1, spiked.columns.get_loc("high")] = float(df["high"].max()) + 500
+    spiked.iloc[-1, spiked.columns.get_loc("low")] = float(df["low"].min()) - 500
+    env2 = G.envelope(spiked, 3, 3, 5)
+    fit2 = G.fit_channel(spiked, env2["highs"], env2["lows"], None, None, 0.5)
+    same2 = (fit2["upper"] is not None and fit2["lower"] is not None
+             and fit2["upper"]["from"] == up["from"] and fit2["upper"]["slope"] == up["slope"]
+             and fit2["lower"]["from"] == lo["from"] and fit2["lower"]["slope"] == lo["slope"])
+    check("a spike in the forming bar does not move the rails", same2,
+          "unchanged" if same2 else "MOVED")
+
+    # Edge cases must return, never raise.
+    for label, frame in (("empty", df.iloc[0:0]), ("one bar", df.iloc[:1]), ("two bars", df.iloc[:2])):
+        try:
+            out = G.fit_channel(frame, highs, lows, None, None, 0.5)
+            check(f"fit_channel on {label} returns a dict", isinstance(out, dict), str(out.get("shape")))
+        except Exception as exc:  # noqa: BLE001
+            check(f"fit_channel on {label} returns a dict", False, repr(exc))
+    out = G.fit_channel(df, highs[:1], lows, None, None, 0.5)
+    check("one pivot on a side leaves that rail None and the other fitted",
+          out["upper"] is None and out["lower"] is not None, str(out["shape"]))
+
+
 def main() -> int:
     print("Chart geometry tests")
     test_timezone()
@@ -813,6 +907,7 @@ def main() -> int:
     test_snap()
     test_degenerate()
     test_json_safety()
+    test_fit_channel()
     test_live()
 
     n_pass = sum(1 for _, s in results if s == PASS)

@@ -753,6 +753,163 @@ def fit_trendline(pivots: list[Pivot], tolerance_pct: float = 0.5) -> dict[str, 
     }
 
 
+def fit_channel(
+    df: pd.DataFrame,
+    highs: list[Pivot],
+    lows: list[Pivot],
+    start: float | None = None,
+    end: float | None = None,
+    tolerance_pct: float = 0.5,
+) -> dict[str, Any]:
+    """Two straight rails that bound price: one through the swing highs, one
+    through the swing lows, each on its own slope.
+
+    A rail is a line through two real pivots of its side. It starts at the
+    earlier of the two and runs to the right edge of the window. It never runs
+    backwards past its first anchor. That rule exists because a support line
+    fitted to three lows on the right of a chart and projected to the left edge
+    was drawn fifty rupees above the candles that were actually there.
+
+    Selection is deterministic, which is the other half of the point: the same
+    bars and the same window must give the same lines every time. Every pair of
+    pivots is a candidate and the winner is the pair whose line is crossed by
+    the fewest bars over its span (a bar whose high sits above the upper rail,
+    or whose low sits below the lower rail, by more than ``tolerance_pct``),
+    then touches the most pivots, then spans the longest, then ends latest. The
+    forming bar is left out of the crossing count: it is still moving, and a
+    channel that changed shape on every tick would read as broken rather than
+    live.
+
+    Args:
+        df: Cleaned OHLCV frame with a DatetimeIndex.
+        highs: Swing highs from :func:`envelope` or :func:`swing_pivots`.
+        lows: Swing lows, likewise.
+        start: Optional lower bound in UTC seconds.
+        end: Optional upper bound in UTC seconds.
+        tolerance_pct: Slack for a touch and for a crossing, as a percentage of
+            the rail's price at that bar.
+
+    Returns:
+        A dict with ``upper`` and ``lower``, each either None (fewer than two
+        pivots on that side) or a dict holding ``from`` and ``to`` as
+        ``{"time", "price"}``, ``slope``, ``intercept``, ``touches``,
+        ``crossings``, ``from_pivot`` and ``to_pivot``; plus ``shape`` (one of
+        rising, falling, contracting, broadening, sideways) and ``width_right``,
+        the vertical distance between the rails at the right edge. All rails
+        share that right edge so they read as one structure.
+    """
+    empty = {"upper": None, "lower": None, "shape": "sideways", "width_right": 0.0}
+    if df is None or len(df) == 0:
+        return empty
+
+    times = to_utc_seconds(df.index)
+    hi = _column(df, "high")
+    lo = _column(df, "low")
+    n = int(times.size)
+    if n == 0:
+        return empty
+
+    mask = np.isfinite(times)
+    if start is not None:
+        mask &= times >= float(start)
+    if end is not None:
+        mask &= times <= float(end)
+    if not mask.any():
+        return empty
+
+    right_edge = float(np.nanmax(times[mask]))
+    forming = n - 1
+    tol = max(float(tolerance_pct), 0.0) / 100.0
+
+    def side(pivots: list[Pivot], kind: str) -> dict[str, Any] | None:
+        pts = sorted(
+            (p for p in pivots if np.isfinite(p.time) and np.isfinite(p.price)),
+            key=lambda p: (p.time, p.index),
+        )
+        if len(pts) < 2:
+            return None
+        pt = np.array([p.time for p in pts], dtype=float)
+        pp = np.array([p.price for p in pts], dtype=float)
+
+        best: tuple[int, int, float, float] | None = None
+        best_pair: tuple[int, int, float, float, int, int] | None = None
+        for i in range(len(pts) - 1):
+            for j in range(i + 1, len(pts)):
+                dt = pt[j] - pt[i]
+                if dt <= 0:
+                    continue
+                slope = (pp[j] - pp[i]) / dt
+                intercept = pp[i] - slope * pt[i]
+
+                span = mask & (times >= pt[i]) & (times <= right_edge)
+                span[forming] = False
+                line = slope * times + intercept
+                slack = np.abs(line) * tol
+                if kind == "high":
+                    crossed = span & (hi > line + slack)
+                else:
+                    crossed = span & (lo < line - slack)
+                crossings = int(np.count_nonzero(crossed))
+
+                fitted = slope * pt + intercept
+                touches = int(np.count_nonzero(np.abs(pp - fitted) <= np.abs(fitted) * tol))
+
+                score = (-crossings, touches, float(dt), float(pt[j]))
+                if best is None or score > best:
+                    best = score
+                    best_pair = (i, j, float(slope), float(intercept), crossings, touches)
+
+        if best_pair is None:
+            return None
+        i, j, slope, intercept, crossings, touches = best_pair
+        t0 = float(pt[i])
+        return {
+            "from": {"time": t0, "price": float(slope * t0 + intercept)},
+            "to": {"time": right_edge, "price": float(slope * right_edge + intercept)},
+            "slope": slope,
+            "intercept": intercept,
+            "touches": touches,
+            "crossings": crossings,
+            "from_pivot": pts[i],
+            "to_pivot": pts[j],
+        }
+
+    upper = side(highs, "high")
+    lower = side(lows, "low")
+
+    shape = "sideways"
+    width_right = 0.0
+    if upper is not None and lower is not None:
+        # Compare the rails where both exist: from the later of the two starts.
+        left_t = max(upper["from"]["time"], lower["from"]["time"])
+        u_left = upper["slope"] * left_t + upper["intercept"]
+        l_left = lower["slope"] * left_t + lower["intercept"]
+        u_right = upper["to"]["price"]
+        l_right = lower["to"]["price"]
+        gap_left = u_left - l_left
+        gap_right = u_right - l_right
+        width_right = float(abs(gap_right))
+        if gap_left > 0 and gap_right > 0:
+            ratio = gap_right / gap_left
+            drift = ((u_right + l_right) - (u_left + l_left)) / 2.0
+            reference = max(gap_left, gap_right)
+            if ratio < 0.7:
+                shape = "contracting"
+            elif ratio > 1.4:
+                shape = "broadening"
+            elif drift > reference * 0.5:
+                shape = "rising"
+            elif drift < -reference * 0.5:
+                shape = "falling"
+    elif upper is not None or lower is not None:
+        rail = upper if upper is not None else lower
+        rise = rail["to"]["price"] - rail["from"]["price"]
+        if abs(rise) > 0:
+            shape = "rising" if rise > 0 else "falling"
+
+    return {"upper": upper, "lower": lower, "shape": shape, "width_right": width_right}
+
+
 def support_resistance(
     df: pd.DataFrame,
     bins: int = 0,
