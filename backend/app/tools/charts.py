@@ -42,12 +42,12 @@ than read off a doc page. Each one shaped a decision here.
 
   7. Toolkit.register splits on inspect.iscoroutinefunction (tools/toolkit.py:196), and
      an async GENERATOR answers False to that while a plain `async def` answers True.
-     So the eleven drawing tools land in Toolkit.functions and the three analysis tools
-     land in Toolkit.async_functions. get_async_functions() merges both and is what the
-     agent reads in async mode, so all fourteen are present under agent.arun, which is
-     the only path the backend uses. THIS TOOLKIT REQUIRES arun: under the synchronous
-     agent.run, get_functions() returns the eleven and models/base.py would str() an
-     un-drained async generator rather than execute it.
+     So the eleven drawing tools and the one catalogue lookup land in Toolkit.functions
+     and the three analysis tools land in Toolkit.async_functions. get_async_functions()
+     merges both and is what the agent reads in async mode, so all fifteen are present
+     under agent.arun, which is the only path the backend uses. THIS TOOLKIT REQUIRES
+     arun: under the synchronous agent.run, get_functions() returns the twelve and
+     models/base.py would str() an un-drained async generator rather than execute it.
 
 Everything the model can see is short. Geometry rides the event; the tool result is one
 sentence, so a twelve-vertex envelope costs the model roughly a hundred characters.
@@ -55,6 +55,15 @@ Blocking work (candle fetch, indicator maths, pivot detection) goes through
 asyncio.to_thread, because agno calls a tool entrypoint on the event loop directly and
 never offloads it to a worker (tools/function.py:1320-1332); a blocking call there would
 stall every other SSE stream in the process.
+
+NAME RESOLUTION, measured rather than assumed. All 102 chart indicators resolved by
+exact id and by exact display name, but a corpus of 145 phrasings a trader actually
+types resolved 100, a 69.0% hit rate: "bbands", "stoch rsi", "willr", "kst", "keltner",
+"cmf", "ao", "vix fix", "20 ema" and 36 others returned None and burned a turn on
+RetryAgentRun. match_indicator now runs six steps, exact first and fuzzy last, and the
+same corpus resolves 145 of 145. The fuzzy steps refuse to guess: where more than one
+indicator could be meant they hand the collision back so the caller asks, because a
+wrong indicator drawn confidently is worse than one honest question.
 """
 
 from __future__ import annotations
@@ -63,7 +72,9 @@ import asyncio
 import json
 import logging
 import math
+import re
 from dataclasses import dataclass
+from difflib import get_close_matches
 from functools import lru_cache
 from itertools import permutations
 from pathlib import Path
@@ -141,25 +152,82 @@ NO_GEOMETRY = (
     "detected. Report this as a backend problem rather than inventing levels."
 )
 
-#: Spoken forms that do not match a registry id. Everything else is resolved from the
-#: generated catalogue, so this list stays short by design.
+#: How many indicators can carry their settings in one tool result before the payload
+#: has to fall back to names only. Measured on the real catalogue: 45 entries with
+#: settings is about 6,500 characters, all 102 is 14,726, over the 12,000 cap.
+LIST_DETAIL_LIMIT = 45
+
+#: Below this many characters a typed name is never resolved by prefix or containment.
+#: Two-letter forms are all abbreviations, and an abbreviation that is not in the table
+#: below is a guess. It stops "ac" (Accelerator Oscillator, which this chart does not
+#: have) landing on Accumulation/Distribution because that display name starts "Ac".
+MIN_FUZZY_CHARS = 3
+
+#: Standard abbreviations and spoken forms that no amount of string matching derives,
+#: keyed on the NORMALISED form: lowercase, letters and digits only. So "%R" arrives
+#: here as "r", "Bollinger Bands" as "bollingerbands" and "Stoch RSI" as "stochrsi".
+#:
+#: Short forms that are already registry ids are deliberately absent, because they
+#: resolve at step (a) of match_indicator: adx, alma, atr, cci, dema, dpo, hma, kama,
+#: mfi, nvi, obv, ppo, pvi, pvo, pvt, roc, rsi, smi, t3, tema, trix, tsi, vwma, wma.
+#: So are forms the normalised compare already handles, such as "parabolic sar" and
+#: "stochastic rsi". Nothing here is invented; every entry is a form traders write.
 _ID_ALIASES = {
-    "bollinger bands": "bollinger",
-    "bollinger band": "bollinger",
+    # Bollinger. "boll" is not here: it hits three bollinger* ids and the prefix step
+    # picks the one the other two extend, which is the same answer for a better reason.
     "bb": "bollinger",
-    "psar": "parabolic-sar",
-    "parabolic sar": "parabolic-sar",
-    "sar": "parabolic-sar",
-    "moving average": "sma",
-    "simple moving average": "sma",
-    "exponential moving average": "ema",
-    "super trend": "supertrend",
+    "bbands": "bollinger",
+    "bband": "bollinger",
+    "bollingerband": "bollinger",
+    "bbw": "bollinger-bandwidth",
+    "b": "bollinger-percent-b",          # "%b"
+    "percentb": "bollinger-percent-b",
+    # Moving averages. The display names are the bare acronyms (SMA, EMA, WMA), so the
+    # spelled-out forms have to be mapped by hand. Without the WMA entry "weighted
+    # moving average" is swallowed by Volume Weighted Moving Average.
+    "movingaverage": "sma",
+    "simplemovingaverage": "sma",
+    "exponentialmovingaverage": "ema",
+    "weightedmovingaverage": "wma",
     "st": "supertrend",
+    "psar": "parabolic-sar",
+    "sar": "parabolic-sar",
+    # Momentum.
+    "relativestrengthindex": "rsi",
     "stoch": "stochastic",
-    "ichimoku cloud": "ichimoku",
-    "relative strength index": "rsi",
-    "average true range": "atr",
-    "on balance volume": "obv",
+    "stochrsi": "stochastic-rsi",
+    "srsi": "stochastic-rsi",
+    "willr": "williams-percent-r",
+    "wr": "williams-percent-r",          # "w%r"
+    "r": "williams-percent-r",           # "%r"
+    "williamsr": "williams-percent-r",   # "williams %r"
+    "kst": "know-sure-thing",
+    "ao": "awesome-oscillator",
+    "bop": "balance-of-power",
+    "cmo": "chande-momentum",
+    "uo": "ultimate-oscillator",
+    "wt": "wavetrend",
+    # RVI is written for both Relative Vigor Index and Relative Volatility Index, and
+    # both are in this catalogue. It points at the vigor index because that is what
+    # every charting package's built-in "RVI" is; a user who meant the volatility one
+    # gets it by saying "relative volatility", which resolves exactly.
+    "rvi": "relative-vigor-index",
+    # Volume.
+    "ad": "adl",
+    "cmf": "chaikin-money-flow",
+    "efi": "elder-force-index",
+    "eom": "ease-of-movement",
+    "emv": "ease-of-movement",
+    "kvo": "klinger-oscillator",
+    # Volatility and trend.
+    "averagetruerange": "atr",
+    "dmi": "adx",
+    "wvf": "williams-vix-fix",
+    "cks": "chande-kroll-stop",
+    "hv": "historical-volatility",
+    "adr": "average-daily-range",
+    "stdev": "standard-deviation",
+    "stddev": "standard-deviation",
 }
 
 
@@ -204,6 +272,205 @@ def load_catalogue() -> dict[str, Any]:
         return {"count": 0, "indicators": {}, "chart_types": []}
 
 
+@lru_cache(maxsize=1)
+def _catalogue_index() -> tuple[dict[str, str], dict[str, str]]:
+    """Two normalised lookup maps over the catalogue: by id, and by display name.
+
+    Checked against the shipped catalogue: no two ids normalise to the same key, no two
+    display names do either, and no name key names a different indicator than an id key
+    of the same text. A plain dict is therefore enough, and the test asserts it.
+
+    Returns:
+        An (ids, names) pair, each mapping a normalised key to a registry id.
+    """
+    catalogue = load_catalogue().get("indicators", {})
+    ids = {_norm(key): key for key in catalogue}
+    names = {_norm(entry.get("name", "")): key for key, entry in catalogue.items()}
+    names.pop("", None)
+    return ids, names
+
+
+def _norm(text: Any) -> str:
+    """Lowercase, letters and digits only. "Williams %R" becomes "williamsr"."""
+    return "".join(ch for ch in str(text or "").lower() if ch.isalnum())
+
+
+def _words(text: str) -> list[str]:
+    """Split on whitespace and on the separators people type between words."""
+    return [w for w in re.split(r"[\s,;/_]+", str(text or "").strip().lower()) if w]
+
+
+_BARE_NUMBER = re.compile(r"^-?\d+(?:\.\d+)?$")
+_GLUED_NUMBER = re.compile(r"^(?P<word>.*[a-z])(?P<number>\d+(?:\.\d+)?)$")
+
+
+def _split_numbers(raw: str) -> tuple[str, list[float]]:
+    """Peel bare numbers off the front and back of a spoken indicator name.
+
+    "20 ema" and "ema 20" are the same request, and both have to apply the 20. Numbers
+    in the MIDDLE are left alone, and a name that is nothing but numbers is returned
+    untouched, so there is always something left to resolve.
+
+    Args:
+        raw: What the user typed, for example "20 ema" or "supertrend 3,10".
+
+    Returns:
+        A (name, values) pair, the values in the order they were spoken.
+    """
+    words = _words(raw)
+    leading: list[float] = []
+    trailing: list[float] = []
+    while words and _BARE_NUMBER.match(words[0]):
+        leading.append(float(words.pop(0)))
+    while words and _BARE_NUMBER.match(words[-1]):
+        trailing.insert(0, float(words.pop()))
+    if not words:
+        return " ".join(_words(raw)), []
+    return " ".join(words), leading + trailing
+
+
+def _prefix_head(candidates: list[str]) -> str | None:
+    """The one candidate that every other candidate extends, if there is one.
+
+    "boll" hits bollinger, bollinger-bandwidth and bollinger-percent-b. The first is
+    the head of the other two, so it is the base indicator and the other two are its
+    variants: answer bollinger. "chaikin" hits chaikin-money-flow, chaikin-oscillator
+    and chaikin-volatility, none of which is a head of the others, so it stays
+    ambiguous and the caller asks. This is the only place a multi-way match resolves.
+
+    Args:
+        candidates: Registry ids that all matched the same typed text.
+
+    Returns:
+        The head id, or None when the collision is genuine.
+    """
+    for candidate in candidates:
+        stem = _norm(candidate)
+        if all(_norm(other).startswith(stem) for other in candidates):
+            return candidate
+    return None
+
+
+def _match_name(text: str) -> tuple[str | None, list[str]]:
+    """Match a name with no numbers in it against the catalogue.
+
+    Six steps, stopping at the first hit, exact before fuzzy:
+      a. exact registry id
+      b. exact display name, case-insensitive
+      c. normalised compare on both, which alone fixes "stochrsi", "super trend",
+         "half trend" and "williams %r" style punctuation
+      d. the hand-written abbreviation table
+      e. prefix, in both directions: an id or display name that starts with the typed
+         text ("keltner", "ulcer", "coppock", "choppiness"), or a run of whole typed
+         words that IS an id or display name ("donchian channel", "the rsi"). The
+         reverse direction is anchored on word boundaries on purpose: without that,
+         "smart money concepts" starts with "sma" and would draw a moving average.
+      f. containment, the last resort: the typed text sits inside exactly one id or
+         display name ("vix fix", "force index", "cloud").
+
+    Steps e and f resolve only when the answer is unique, or when _prefix_head finds
+    the one indicator the other matches are variants of. Any other collision returns
+    None WITH the candidates, so the caller can ask instead of guessing.
+
+    Args:
+        text: A spoken or typed indicator name, numbers already stripped.
+
+    Returns:
+        An (id, candidates) pair. `candidates` is only populated when the text was
+        ambiguous; a name that matched nothing at all comes back with an empty list.
+    """
+    catalogue = load_catalogue().get("indicators", {})
+    lowered = (text or "").strip().lower()
+    if not lowered or not catalogue:
+        return None, []
+
+    if lowered in catalogue:
+        return lowered, []
+    for key, entry in catalogue.items():
+        if str(entry.get("name", "")).lower() == lowered:
+            return key, []
+
+    ids, names = _catalogue_index()
+    tight = _norm(lowered)
+    if not tight:
+        return None, []
+    if tight in ids:
+        return ids[tight], []
+    if tight in names:
+        return names[tight], []
+    if tight in _ID_ALIASES and _ID_ALIASES[tight] in catalogue:
+        return _ID_ALIASES[tight], []
+
+    forward = sorted({i for k, i in ids.items() if k.startswith(tight)}
+                     | {i for k, i in names.items() if k.startswith(tight)})
+    if forward:
+        # A hit here settles it either way: falling through to a looser step after
+        # finding real candidates is how "smi ergodic" would end up as plain SMI.
+        if len(tight) < MIN_FUZZY_CHARS:
+            return None, forward
+        if len(forward) == 1:
+            return forward[0], []
+        head = _prefix_head(forward)
+        return (head, []) if head else (None, forward)
+
+    words = _words(lowered)
+    runs = {_norm("".join(words[i:j]))
+            for i in range(len(words)) for j in range(i + 1, len(words) + 1)}
+    spoken = sorted({ids[r] for r in runs if r in ids}
+                    | {names[r] for r in runs if r in names})
+    if spoken:
+        return (spoken[0], []) if len(spoken) == 1 else (None, spoken)
+
+    if len(tight) >= MIN_FUZZY_CHARS:
+        inside = sorted({i for k, i in ids.items() if tight in k}
+                        | {i for k, i in names.items() if tight in k})
+        if inside:
+            return (inside[0], []) if len(inside) == 1 else (None, inside)
+    return None, []
+
+
+@dataclass(frozen=True)
+class IndicatorMatch:
+    """What one spoken indicator phrase resolved to.
+
+    Attributes:
+        indicator_id: The registry id, or None when nothing matched unambiguously.
+        values: Bare numbers said alongside the name, in the order spoken. "20 ema"
+            carries [20.0]; they are landed on named settings by assign_positional.
+        candidates: The colliding ids when the phrase was ambiguous, so the caller can
+            name them and ask. Empty when the phrase simply matched nothing.
+    """
+
+    indicator_id: str | None
+    values: tuple[float, ...] = ()
+    candidates: tuple[str, ...] = ()
+
+
+def match_indicator(raw: str) -> IndicatorMatch:
+    """Map whatever the user said onto a chart registry id, numbers included.
+
+    Args:
+        raw: A spoken or typed indicator name, such as "20 ema", "stoch rsi",
+            "willr" or "supertrend 3,10".
+
+    Returns:
+        IndicatorMatch: the resolved id, any bare numbers spoken with it, and the
+            colliding candidates when the name was ambiguous.
+    """
+    text, values = _split_numbers(raw)
+    found, candidates = _match_name(text)
+    if found is None and not candidates:
+        # Last chance for a number glued to the name, as in "ema20". Tried only after
+        # the whole string has failed, so real ids that end in a digit, "t3" above all,
+        # are never torn apart.
+        glued = _GLUED_NUMBER.match(_norm(text))
+        if glued:
+            found, candidates = _match_name(glued.group("word"))
+            if found is not None:
+                values = values + [float(glued.group("number"))]
+    return IndicatorMatch(found, tuple(values), tuple(candidates))
+
+
 def resolve_indicator_id(raw: str) -> str | None:
     """Map whatever the user said onto a chart registry id.
 
@@ -211,34 +478,78 @@ def resolve_indicator_id(raw: str) -> str | None:
         raw: A spoken or typed indicator name.
 
     Returns:
-        The registry id, or None if nothing matches.
+        The registry id, or None if nothing matches unambiguously.
     """
-    catalogue = load_catalogue().get("indicators", {})
-    text = (raw or "").strip().lower()
-    if not text:
-        return None
-    if text in catalogue:
-        return text
-    if text in _ID_ALIASES and _ID_ALIASES[text] in catalogue:
-        return _ID_ALIASES[text]
+    return match_indicator(raw).indicator_id
 
-    hyphened = text.replace(" ", "-").replace("_", "-")
-    if hyphened in catalogue:
-        return hyphened
-    if hyphened in _ID_ALIASES and _ID_ALIASES[hyphened] in catalogue:
-        return _ID_ALIASES[hyphened]
 
-    tight = text.replace(" ", "").replace("-", "").replace("_", "")
-    for key, entry in catalogue.items():
-        if key.replace("-", "") == tight:
-            return key
-        if str(entry.get("name", "")).lower().replace(" ", "").replace("-", "") == tight:
-            return key
-    return None
+def suggest_indicator_ids(raw: str, limit: int = 6) -> list[str]:
+    """Registry ids close enough to the typed text to be worth naming in an error.
+
+    Args:
+        raw: What the user typed.
+        limit: How many ids to name at most.
+
+    Returns:
+        The closest ids, best first, or an empty list when nothing is close.
+    """
+    ids, names = _catalogue_index()
+    tight = _norm(raw)
+    if not tight:
+        return []
+    pool: dict[str, str] = {**ids, **names}
+    out: list[str] = []
+    for key in get_close_matches(tight, list(pool), n=limit * 2, cutoff=0.6):
+        if pool[key] not in out:
+            out.append(pool[key])
+    if not out:
+        stem = tight[:MIN_FUZZY_CHARS]
+        out = sorted({i for k, i in pool.items() if k.startswith(stem)})
+    return out[:limit]
 
 
 def _numeric_inputs(entry: dict) -> list[dict]:
     return [i for i in entry.get("inputs", []) if i.get("type") == "number"]
+
+
+def _setting_summary(spec: dict) -> str:
+    """One numeric setting as "key=default [min..max]", which is what the model needs.
+
+    Args:
+        spec: One numeric input from a catalogue entry.
+
+    Returns:
+        A single short string, so a whole catalogue row costs about 145 characters.
+    """
+    low, high = spec.get("min"), spec.get("max")
+    if low is not None and high is not None:
+        span = f" [{_tidy(low)}..{_tidy(high)}]"
+    elif low is not None:
+        span = f" [min {_tidy(low)}]"
+    elif high is not None:
+        span = f" [max {_tidy(high)}]"
+    else:
+        span = ""
+    return f"{spec['key']}={spec.get('default')}{span}"
+
+
+def _catalogue_row(key: str, entry: dict) -> dict[str, Any]:
+    """One catalogue entry shrunk to what add_chart_indicator actually needs.
+
+    Args:
+        key: The registry id.
+        entry: The catalogue entry.
+
+    Returns:
+        The id, display name, category, pane placement and numeric settings.
+    """
+    return {
+        "id": key,
+        "name": entry.get("name"),
+        "category": entry.get("category"),
+        "pane": entry.get("placement"),
+        "settings": [_setting_summary(spec) for spec in _numeric_inputs(entry)],
+    }
 
 
 def _in_bounds(spec: dict, value: float) -> bool:
@@ -587,6 +898,7 @@ class ChartTools(Toolkit):
                 self.set_chart_symbol,
                 self.set_chart_interval,
                 self.set_chart_type,
+                self.list_chart_indicators,
                 self.add_chart_indicator,
                 self.remove_chart_indicator,
                 self.clear_annotations,
@@ -739,20 +1051,106 @@ class ChartTools(Toolkit):
         yield ChartCommandEvent(commands=[{"op": "set_chart_type", "chartType": wanted}])
         yield f"Chart type set to {wanted}."
 
+    def list_chart_indicators(self, query: str = "", category: str = "") -> str:
+        """Search the chart's own 102 indicators by name, keyword or category.
+
+        Use this instead of guessing an id, and whenever a name the user said did not
+        resolve. This is the chart's drawing registry, which is not the same set as the
+        analysis library behind list_indicators: only what is listed here can be drawn.
+
+        Args:
+            query (str): Optional keyword matched against the id, the display name and
+                the category, for example "bollinger", "volume" or "stochastic". An
+                abbreviation such as "willr" or "bbands" works too.
+            category (str): Optional exact category filter. One of Trend, Momentum,
+                Volatility or Volume.
+
+        Returns:
+            str: JSON listing the matching indicators with their numeric settings and
+                the pane each one draws in, or, when too many match to describe in one
+                result, their ids grouped by category.
+        """
+        catalogue = load_catalogue().get("indicators", {})
+        if not catalogue:
+            return to_json(err("indicator catalogue is missing from this build",
+                               "list_chart_indicators"))
+
+        known = sorted({str(entry.get("category") or "other")
+                        for entry in catalogue.values()})
+        wanted = (category or "").strip().lower()
+        if wanted and wanted not in {c.lower() for c in known}:
+            raise RetryAgentRun(
+                f"Unknown chart category {category!r}. Valid categories: "
+                f"{', '.join(known)}."
+            )
+
+        text = _norm(query)
+        pool = [(key, entry) for key, entry in catalogue.items()
+                if not wanted or str(entry.get("category", "")).lower() == wanted]
+        matches = [(key, entry) for key, entry in pool
+                   if not text
+                   or text in _norm(f"{key} {entry.get('name', '')} "
+                                    f"{entry.get('category', '')}")]
+
+        if not matches and text:
+            # A keyword that is not a substring of anything is usually an abbreviation,
+            # so the same matcher add_chart_indicator uses gets a turn before failing.
+            found = {key for key, _ in pool}
+            near = [i for i in [match_indicator(query).indicator_id] if i]
+            near += suggest_indicator_ids(query)
+            matches = [(i, catalogue[i]) for i in dict.fromkeys(near)
+                       if i in catalogue and i in found]
+
+        if not matches:
+            raise RetryAgentRun(
+                f"No chart indicator matches {query!r}"
+                + (f" in {category}" if wanted else "")
+                + ". Try a broader keyword, or call list_chart_indicators with no "
+                  "arguments to see every category."
+            )
+
+        # All 102 with their settings is 14,726 characters, over the 12,000 cap in
+        # to_json, and a truncated result reaches the model as an error object. Above
+        # the threshold it is ids grouped by category instead, which is 1,418.
+        if len(matches) > LIST_DETAIL_LIMIT:
+            grouped: dict[str, list[str]] = {}
+            for key, entry in matches:
+                name = str(entry.get("category") or "other")
+                grouped.setdefault(name, []).append(key)
+            return to_json(ok({
+                "total": len(matches),
+                "detail_omitted": True,
+                "hint": "Ids only, because the whole catalogue with settings is larger "
+                        "than one tool result. Pass a query such as 'bollinger' or a "
+                        "category to get each indicator's settings and pane.",
+                "categories": known,
+                "by_category": grouped,
+            }, "list_chart_indicators"))
+
+        return to_json(ok({
+            "total": len(matches),
+            "categories": known,
+            "indicators": [_catalogue_row(key, entry) for key, entry in matches],
+        }, "list_chart_indicators"))
+
     async def add_chart_indicator(self, indicator_id: str, settings: dict | None = None,
                                   run_context: RunContext | None = None):
         """Add an indicator to the chart, with the settings the user asked for.
 
         There are 102 indicators in the chart's own registry, each with named settings
-        and declared bounds. Pass named settings when you know them. When the user gave
-        bare numbers ("supertrend 3,10"), pass them positionally as
-        {"values": [3, 10]}: they are landed on the indicator's numeric settings by
-        closeness to its declared defaults, and the reply states which reading was used
-        so the user can correct it in a few words.
+        and declared bounds. Say the name however the user did: abbreviations
+        ("bbands", "willr", "kst"), short forms ("keltner", "coppock") and a length
+        spoken with the name ("20 ema", "ema 20") all resolve, and an ambiguous name is
+        reported with its candidates rather than guessed at. Pass named settings when
+        you know them. When the user gave bare numbers ("supertrend 3,10"), pass them
+        positionally as {"values": [3, 10]}: they are landed on the indicator's numeric
+        settings by closeness to its declared defaults, and the reply states which
+        reading was used so the user can correct it in a few words.
 
         Args:
             indicator_id (str): Indicator name or registry id, for example "supertrend",
-                "rsi", "bollinger", "macd" or "ichimoku".
+                "rsi", "bollinger", "macd", "ichimoku" or "20 ema". Call
+                list_chart_indicators if you are not sure the chart has it.
             settings (dict): Optional. Either named settings such as
                 {"period": 10, "multiplier": 3}, or bare numbers as spoken, such as
                 {"values": [3, 10]}. Leave empty for the indicator's own defaults.
@@ -766,23 +1164,35 @@ class ChartTools(Toolkit):
                               "add_chart_indicator"))
             return
 
-        resolved = resolve_indicator_id(indicator_id)
-        if resolved is None:
-            text = (indicator_id or "").strip().lower()
-            near = [k for k in catalogue if text and (text[:3] in k or k[:3] in text)][:6]
+        match = match_indicator(indicator_id)
+        if match.indicator_id is None:
+            # An ambiguous name is a question, not a failure. Drawing the wrong
+            # indicator confidently costs the user more than one clarifying turn.
+            if len(match.candidates) > 1:
+                raise RetryAgentRun(
+                    f"{indicator_id!r} matches {len(match.candidates)} of the chart's "
+                    f"indicators: {', '.join(match.candidates)}. Ask the user which "
+                    "one they meant rather than picking one, or call "
+                    "list_chart_indicators to see what each is."
+                )
+            near = list(match.candidates) or suggest_indicator_ids(indicator_id)
             hint = f" Closest ids: {', '.join(near)}." if near else ""
             raise RetryAgentRun(
                 f"The chart has no indicator called {indicator_id!r}.{hint} "
-                f"There are {len(catalogue)} available, including supertrend, rsi, "
-                "macd, bollinger, ema, sma, vwap, adx, atr and ichimoku."
+                f"There are {len(catalogue)} available; call list_chart_indicators to "
+                "search them by name, keyword or category."
             )
 
+        resolved = match.indicator_id
         entry = catalogue[resolved]
         by_key = {i["key"]: i for i in entry.get("inputs", [])}
         applied: dict[str, Any] = {}
         reading = ""
 
-        positional = _coerce_values(settings)
+        # One path for every bare number, whether it arrived in settings["values"] or
+        # was spoken as part of the name. Explicit values win: they are the more
+        # deliberate of the two.
+        positional = _coerce_values(settings) or list(match.values)
         if positional:
             applied, reading = assign_positional(entry, positional)
 
@@ -821,7 +1231,10 @@ class ChartTools(Toolkit):
         }])
 
         sentence = f"Added {entry['name']} to the chart with {described}."
-        if positional and reading:
+        # The reading is only worth stating when it could have gone another way. An
+        # indicator with a single numeric setting has exactly one place a number can
+        # land, so "20 ema" reports Length 20 and stops talking.
+        if positional and reading and len(_numeric_inputs(entry)) > 1:
             spoken = ",".join(str(_tidy(v)) for v in positional)
             sentence += (
                 f" Read {spoken} as {reading}; say which setting you meant if that is "

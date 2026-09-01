@@ -186,7 +186,7 @@ def _chart_toolkit(client=None, frames=None):
 
     Scoped the same way order tools are, and for the same reason: a tool the model
     cannot use is a tool it can still pick wrongly. The chat page has no chart to
-    act on, so it never sees these fourteen.
+    act on, so it never sees these fifteen.
     """
     try:
         from .tools.charts import ChartTools

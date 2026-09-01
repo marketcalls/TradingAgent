@@ -28,6 +28,7 @@ import { TOOL_LABELS } from "../ToolTimeline"
 const CHART_TOOL_LABELS: Record<string, string> = {
   ...TOOL_LABELS,
   get_chart_frame: "Reading the chart frame",
+  list_chart_indicators: "Looking through the indicators",
   get_chart_context: "Reading the chart",
   capture_chart: "Looking at the chart",
   find_swing_points: "Finding the swing points",

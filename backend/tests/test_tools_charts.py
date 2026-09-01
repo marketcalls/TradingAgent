@@ -46,10 +46,12 @@ from typing import get_args  # noqa: E402
 from app.openalgo.client import get_client  # noqa: E402
 from app.openalgo.normalize import MAX_TOOL_CHARS  # noqa: E402
 from app.tools.charts import (  # noqa: E402
+    LIST_DETAIL_LIMIT,
     ChartCommandEvent,
     ChartTools,
     assign_positional,
     load_catalogue,
+    match_indicator,
     resolve_indicator_id,
 )
 
@@ -58,7 +60,8 @@ results: list[tuple[str, str]] = []
 
 EXPECTED = [
     "set_chart_symbol", "set_chart_interval", "set_chart_type",
-    "add_chart_indicator", "remove_chart_indicator", "clear_annotations",
+    "list_chart_indicators", "add_chart_indicator", "remove_chart_indicator",
+    "clear_annotations",
     "draw_envelope", "draw_trendline", "draw_levels", "draw_zone",
     "project_targets",
     "analyse_trend", "analyse_momentum", "describe_chart",
@@ -76,6 +79,81 @@ LIVE_CONTEXT = {
                     "settings": {"period": 10, "multiplier": 3}}],
     "theme": "dark",
 }
+
+#: How a trader actually names an indicator, spread across all four categories and all
+#: 102 ids. Not one of these is a registry id spelled out in full; they are the
+#: abbreviations, short forms, spoken phrases and length-with-the-name forms that reach
+#: the tool in real use. Against the resolver this replaced, 100 of the 145 resolved.
+COLLOQUIAL = [
+    # Trend
+    ("20 ema", "ema"), ("ema 20", "ema"), ("ema20", "ema"), ("50 sma", "sma"),
+    ("simple moving average", "sma"), ("exponential moving average", "ema"),
+    ("weighted moving average", "wma"), ("hull moving average", "hma"), ("hma", "hma"),
+    ("super trend", "supertrend"), ("supertrend 3,10", "supertrend"),
+    ("st", "supertrend"), ("psar", "parabolic-sar"), ("parabolic sar", "parabolic-sar"),
+    ("ichimoku", "ichimoku"), ("ichimoku cloud", "ichimoku"), ("adx", "adx"),
+    ("dmi", "adx"), ("alma", "alma"), ("dema", "dema"), ("tema", "tema"),
+    ("kama", "kama"), ("kaufman", "kama"), ("t3", "t3"),
+    ("chande kroll", "chande-kroll-stop"), ("cks", "chande-kroll-stop"),
+    ("chandelier exit", "chandelier-exit"), ("aroon", "aroon"),
+    ("aroon oscillator", "aroon-oscillator"), ("lsma", "lsma"),
+    ("linear regression slope", "linreg-slope"), ("ma cross", "ma-cross"),
+    ("mcginley", "mcginley-dynamic"), ("moving average ribbon", "ma-ribbon"),
+    ("twap", "twap"), ("alligator", "alligator"), ("smma", "smma"),
+    ("smoothed moving average", "smma"), ("vortex", "vortex"),
+    ("volatility stop", "volatility-stop"), ("williams fractals", "williams-fractals"),
+    ("fractals", "williams-fractals"), ("cpr", "cpr"), ("alphatrend", "alphatrend"),
+    ("half trend", "halftrend"), ("hull suite", "hull-suite"),
+    ("trend strength index", "trend-strength-index"), ("seasonality", "seasonality"),
+    ("median", "median"), ("consolidation breakout", "consolidation-breakout"),
+    # Volume
+    ("vwap", "vwap"), ("obv", "obv"), ("on balance volume", "obv"),
+    ("cmf", "chaikin-money-flow"), ("chaikin money flow", "chaikin-money-flow"),
+    ("chaikin oscillator", "chaikin-oscillator"), ("eom", "ease-of-movement"),
+    ("ease of movement", "ease-of-movement"), ("efi", "elder-force-index"),
+    ("force index", "elder-force-index"), ("net volume", "net-volume"),
+    ("klinger", "klinger-oscillator"), ("kvo", "klinger-oscillator"), ("vwma", "vwma"),
+    ("nvi", "nvi"), ("pvi", "pvi"), ("pvt", "pvt"), ("pvo", "pvo"), ("adl", "adl"),
+    ("accumulation distribution", "adl"), ("volume", "volume"),
+    # Volatility
+    ("bbands", "bollinger"), ("boll", "bollinger"), ("bollinger bands", "bollinger"),
+    ("atr", "atr"), ("average true range", "atr"), ("vix fix", "williams-vix-fix"),
+    ("wvf", "williams-vix-fix"), ("donchian channel", "donchian"),
+    ("donchian", "donchian"), ("keltner", "keltner-channel"),
+    ("keltner channel", "keltner-channel"),
+    ("bollinger bandwidth", "bollinger-bandwidth"), ("bbw", "bollinger-bandwidth"),
+    ("%b", "bollinger-percent-b"), ("choppiness", "choppiness-index"),
+    ("ulcer", "ulcer-index"), ("historical volatility", "historical-volatility"),
+    ("hv", "historical-volatility"), ("adr", "average-daily-range"),
+    ("chop zone", "chop-zone"), ("standard deviation", "standard-deviation"),
+    ("stdev", "standard-deviation"), ("mass index", "mass-index"),
+    ("relative volatility index", "relative-volatility-index"),
+    ("envelope", "envelope"), ("standard error bands", "standard-error-bands"),
+    ("moving average channel", "ma-channel"), ("bbtrend", "bb-trend"),
+    ("range analysis", "range-analysis"), ("chaikin volatility", "chaikin-volatility"),
+    # Momentum
+    ("rsi", "rsi"), ("macd", "macd"), ("stoch rsi", "stochastic-rsi"),
+    ("stochrsi", "stochastic-rsi"), ("stochastic rsi", "stochastic-rsi"),
+    ("stochastic", "stochastic"), ("stoch", "stochastic"),
+    ("williams %r", "williams-percent-r"), ("willr", "williams-percent-r"),
+    ("%r", "williams-percent-r"), ("kst", "know-sure-thing"),
+    ("know sure thing", "know-sure-thing"), ("ao", "awesome-oscillator"),
+    ("awesome oscillator", "awesome-oscillator"), ("cci", "cci"), ("mfi", "mfi"),
+    ("money flow index", "mfi"), ("bop", "balance-of-power"),
+    ("balance of power", "balance-of-power"), ("cmo", "chande-momentum"),
+    ("chande momentum", "chande-momentum"), ("coppock", "coppock-curve"),
+    ("dpo", "dpo"), ("detrended price oscillator", "dpo"),
+    ("fisher transform", "fisher-transform"), ("connors rsi", "connors-rsi"),
+    ("momentum", "momentum"), ("roc", "roc"), ("rate of change", "roc"),
+    ("ppo", "ppo"), ("trix", "trix"), ("tsi", "tsi"),
+    ("true strength index", "tsi"), ("smi", "smi"),
+    ("ultimate oscillator", "ultimate-oscillator"), ("uo", "ultimate-oscillator"),
+    ("relative vigor", "relative-vigor-index"), ("rvi", "relative-vigor-index"),
+    ("woodies cci", "woodies-cci"), ("special k", "special-k"),
+    ("rsi divergence", "rsi-divergence"), ("wavetrend", "wavetrend"),
+    ("smi ergodic indicator", "smi-ergodic-indicator"),
+    ("smi ergodic oscillator", "smi-ergodic-oscillator"),
+]
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -134,15 +212,16 @@ def test_registration() -> ChartTools:
     print("\n=== toolkit registration ===")
     kit = ChartTools()
     merged = kit.get_async_functions()
-    check("chart_tools registers 14 tools",
+    check("chart_tools registers 15 tools",
           sorted(merged) == sorted(EXPECTED),
-          f"{sorted(merged)}" if sorted(merged) != sorted(EXPECTED) else "14")
+          f"{sorted(merged)}" if sorted(merged) != sorted(EXPECTED) else "15")
 
     # Documented split, asserted so a future refactor cannot flip it in silence:
     # async generators answer False to iscoroutinefunction and land in .functions,
     # plain coroutines land in .async_functions. Only get_async_functions() has both.
-    check("the 11 drawing tools are the sync-dict half",
-          len(kit.functions) == 11 and "draw_envelope" in kit.functions,
+    check("the 11 drawing tools and the catalogue lookup are the sync-dict half",
+          len(kit.functions) == 12 and "draw_envelope" in kit.functions
+          and "list_chart_indicators" in kit.functions,
           f"{len(kit.functions)} in functions")
     check("the 3 analysis tools are the async-dict half",
           sorted(kit.async_functions) == ["analyse_momentum", "analyse_trend",
@@ -177,7 +256,7 @@ def test_schemas(kit: ChartTools) -> None:
             elif "type" not in props[pname] and "anyOf" not in props[pname]:
                 problems.append(f"{fn.name}: arg {pname} has no type")
 
-    check("every tool has a description", described == 14, f"{described}/14")
+    check("every tool has a description", described == 15, f"{described}/15")
     check("every argument reached the schema with a type", not problems,
           "; ".join(problems[:4]) if problems else "clean")
 
@@ -351,6 +430,215 @@ def test_catalogue() -> None:
     check("rsi 21 lands on Length, not on the oversold band",
           assign_positional(indicators["rsi"], [21])[0] == {"length": 21},
           str(assign_positional(indicators["rsi"], [21])[0]))
+
+
+def _tight(text: str) -> str:
+    """The resolver's own normalisation: lowercase, letters and digits only."""
+    return "".join(ch for ch in str(text).lower() if ch.isalnum())
+
+
+def test_resolver() -> None:
+    """Every one of the 102 is reachable, and no fuzzy step ever guesses.
+
+    Three full sweeps, then a corpus of what people actually type, then the collisions
+    that must NOT resolve. The last group is the point of the exercise: a wrong
+    indicator drawn confidently costs more than one clarifying question.
+    """
+    print("\n=== indicator name resolution ===")
+    catalogue = load_catalogue().get("indicators", {})
+    total = len(catalogue)
+
+    # The resolver's lookup maps are plain dicts, so a normalisation collision between
+    # two ids or two display names would silently drop one of them.
+    ids = {_tight(k) for k in catalogue}
+    names = {_tight(e.get("name", "")) for e in catalogue.values()}
+    check("no two ids and no two display names collide once normalised",
+          len(ids) == total and len(names) == total,
+          f"{len(ids)} ids, {len(names)} names, {total} indicators")
+
+    missed = [k for k in catalogue if resolve_indicator_id(k) != k]
+    check(f"all {total} resolve by registry id", not missed,
+          f"{total - len(missed)}/{total}, missed {missed[:5]}")
+
+    missed = [k for k, e in catalogue.items() if resolve_indicator_id(e["name"]) != k]
+    check(f"all {total} resolve by display name", not missed,
+          f"{total - len(missed)}/{total}, missed {missed[:5]}")
+
+    missed = [k for k, e in catalogue.items()
+              if resolve_indicator_id(_tight(k)) != k
+              or resolve_indicator_id(_tight(e["name"])) != k]
+    check(f"all {total} resolve by the normalised form of id and name", not missed,
+          f"{total - len(missed)}/{total}, missed {missed[:5]}")
+
+    # The corpus. Every entry is a phrasing a trader types rather than a registry id.
+    unresolved = [(phrase, want, resolve_indicator_id(phrase))
+                  for phrase, want in COLLOQUIAL
+                  if resolve_indicator_id(phrase) != want]
+    hits = len(COLLOQUIAL) - len(unresolved)
+    print(f"        colloquial corpus: {hits}/{len(COLLOQUIAL)} "
+          f"({hits / len(COLLOQUIAL) * 100:.1f}%)")
+    for phrase, want, got in unresolved:
+        print(f"        UNRESOLVED {phrase!r}: wanted {want}, got {got}")
+    check(f"all {len(COLLOQUIAL)} colloquial phrasings resolve to the right indicator",
+          not unresolved, f"{hits}/{len(COLLOQUIAL)}")
+
+    # Every one of these has a longer id that starts with the same letters. Landing on
+    # the variant instead of the base indicator is the failure mode that matters.
+    check("'rsi' stays RSI, never stochastic-rsi, connors-rsi or rsi-divergence",
+          resolve_indicator_id("rsi") == "rsi", str(resolve_indicator_id("rsi")))
+    check("'sma' stays SMA, never smma",
+          resolve_indicator_id("sma") == "sma", str(resolve_indicator_id("sma")))
+    check("'stochastic' stays Stochastic, never stochastic-rsi",
+          resolve_indicator_id("stochastic") == "stochastic",
+          str(resolve_indicator_id("stochastic")))
+    check("'bollinger' stays Bollinger Bands, never the bandwidth or %b variant",
+          resolve_indicator_id("bollinger") == "bollinger",
+          str(resolve_indicator_id("bollinger")))
+    check("'smi' stays Stochastic Momentum Index, never an ergodic variant",
+          resolve_indicator_id("smi") == "smi", str(resolve_indicator_id("smi")))
+
+    # "ma" is genuinely ambiguous, so it must ask rather than pick.
+    ambiguous = match_indicator("ma")
+    check("'ma' resolves to nothing, because it could be any of several",
+          ambiguous.indicator_id is None, str(ambiguous.indicator_id))
+    check("'ma' hands back the candidates so the caller can ask",
+          len(ambiguous.candidates) > 1 and "ma-cross" in ambiguous.candidates
+          and "ma-ribbon" in ambiguous.candidates, str(ambiguous.candidates))
+
+    for phrase in ("chaikin", "smi ergodic", "hull", "chop"):
+        match = match_indicator(phrase)
+        check(f"{phrase!r} is reported as ambiguous, not guessed at",
+              match.indicator_id is None and len(match.candidates) > 1,
+              f"{match.indicator_id} {match.candidates}")
+
+    nothing = match_indicator("moon phase")
+    check("a name that matches nothing resolves to nothing, with no candidates",
+          nothing.indicator_id is None and not nothing.candidates
+          and not nothing.values, str(nothing))
+
+    # A number said with the name is the indicator's length, either way round.
+    for phrase in ("20 ema", "ema 20", "ema20"):
+        match = match_indicator(phrase)
+        check(f"{phrase!r} is an EMA carrying the 20",
+              match.indicator_id == "ema" and list(match.values) == [20.0], str(match))
+    settings, _ = assign_positional(catalogue["ema"],
+                                    list(match_indicator("20 ema").values))
+    check("the spoken 20 lands on Length through assign_positional, not a second path",
+          settings == {"length": 20}, str(settings))
+
+    check("a digit that is part of an id is never torn off it",
+          match_indicator("t3").indicator_id == "t3"
+          and not match_indicator("t3").values, str(match_indicator("t3")))
+    match = match_indicator("supertrend 3,10")
+    check("'supertrend 3,10' keeps both numbers in the order they were said",
+          match.indicator_id == "supertrend" and list(match.values) == [3.0, 10.0],
+          str(match))
+
+
+def test_list_chart_indicators(kit: ChartTools) -> None:
+    print("\n=== list_chart_indicators ===")
+    listing = kit.get_async_functions()["list_chart_indicators"].entrypoint
+
+    body = listing()
+    payload = json.loads(body)
+    data = payload["data"]
+    check("an empty query still answers, with the whole catalogue",
+          payload["ok"] and data["total"] == 102, str(data.get("total")))
+    # 102 rows with their settings is 14,726 characters, so the whole catalogue can
+    # only be returned as ids. Same trade-off, same flag, as list_indicators.
+    check("the full catalogue drops detail rather than being truncated",
+          data.get("detail_omitted") is True
+          and sum(len(v) for v in data["by_category"].values()) == 102,
+          str(sorted(data.get("by_category", {}))))
+    check("the full listing stays under the 12,000 char cap",
+          len(body) < MAX_TOOL_CHARS, f"{len(body)} chars of {MAX_TOOL_CHARS}")
+
+    oversize = []
+    for category in ("Trend", "Momentum", "Volatility", "Volume"):
+        body = listing(category=category)
+        rows = json.loads(body)["data"]["indicators"]
+        if len(body) > MAX_TOOL_CHARS:
+            oversize.append(f"{category}={len(body)}")
+        if category == "Momentum":
+            check("a category filter returns exactly that category, with settings",
+                  len(rows) == 29 and all(r["category"] == "Momentum" for r in rows),
+                  f"{len(rows)} rows")
+            check("each row carries the settings add_chart_indicator needs",
+                  any(r["id"] == "macd"
+                      and "fastPeriod=12 [1..500]" in r["settings"] for r in rows),
+                  str(next((r for r in rows if r["id"] == "macd"), {}))[:110])
+    check("no category listing exceeds the cap", not oversize, str(oversize))
+    check("the category filter is case-insensitive",
+          json.loads(listing(category="trend"))["data"]["total"] == 36,
+          str(json.loads(listing(category="trend"))["data"]["total"]))
+
+    rows = json.loads(listing(query="bollinger"))["data"]["indicators"]
+    check("a keyword query narrows to that family",
+          sorted(r["id"] for r in rows)
+          == ["bollinger", "bollinger-bandwidth", "bollinger-percent-b"],
+          str([r["id"] for r in rows]))
+
+    # A keyword that is a substring of nothing is usually an abbreviation, so the
+    # search falls back to the same matcher add_chart_indicator uses.
+    rows = json.loads(listing(query="willr"))["data"]["indicators"]
+    check("an abbreviation query still finds its indicator, first",
+          rows and rows[0]["id"] == "williams-percent-r",
+          str([r["id"] for r in rows]))
+
+    check("the detail threshold is the same one list_indicators uses",
+          LIST_DETAIL_LIMIT == 45, str(LIST_DETAIL_LIMIT))
+
+    try:
+        listing(category="nonsense")
+        check("an unknown category raises RetryAgentRun", False, "no raise")
+    except RetryAgentRun as exc:
+        check("an unknown category raises RetryAgentRun naming the valid ones",
+              "Valid categories" in str(exc), str(exc)[:80])
+
+    try:
+        listing(query="moon phase")
+        check("a query that matches nothing raises RetryAgentRun", False, "no raise")
+    except RetryAgentRun as exc:
+        check("a query that matches nothing raises RetryAgentRun",
+              "No chart indicator matches" in str(exc), str(exc)[:80])
+
+
+async def test_spoken_indicators(kit: ChartTools) -> None:
+    print("\n=== spoken indicator names through the tool ===")
+    functions = kit.get_async_functions()
+    rc = context_for(LIVE_CONTEXT)
+
+    for phrase in ("20 ema", "ema 20"):
+        cmds, text, _ = await drive(functions["add_chart_indicator"], rc,
+                                    indicator_id=phrase)
+        check(f"{phrase!r} reaches the chart as an EMA of length 20",
+              cmds == [{"op": "add_indicator", "indicatorId": "ema",
+                        "settings": {"length": 20}}], str(cmds))
+        print(f"        reply: {text}")
+
+    for phrase, want in (("bbands", "bollinger"), ("stoch rsi", "stochastic-rsi"),
+                         ("willr", "williams-percent-r"), ("kst", "know-sure-thing"),
+                         ("keltner", "keltner-channel"), ("vix fix",
+                                                          "williams-vix-fix")):
+        cmds, _, _ = await drive(functions["add_chart_indicator"], rc,
+                                 indicator_id=phrase)
+        check(f"{phrase!r} draws {want}",
+              cmds and cmds[0]["indicatorId"] == want, str(cmds))
+
+    try:
+        await drive(functions["add_chart_indicator"], rc, indicator_id="ma")
+        check("an ambiguous name asks instead of drawing one at random", False,
+              "no raise")
+    except RetryAgentRun as exc:
+        check("an ambiguous name asks instead of drawing one at random, and lists them",
+              "ma-cross" in str(exc) and "matches 5" in str(exc), str(exc)[:110])
+
+    try:
+        await drive(functions["add_chart_indicator"], rc, indicator_id="bolinger")
+        check("a misspelling names the closest ids it did find", False, "no raise")
+    except RetryAgentRun as exc:
+        check("a misspelling names the closest ids it did find",
+              "Closest ids: bollinger" in str(exc), str(exc)[:110])
 
 
 async def test_indicator_tool(kit: ChartTools) -> None:
@@ -622,7 +910,10 @@ async def main_async() -> int:
     test_confirmation_flags(kit)
     test_event_contract()
     test_catalogue()
+    test_resolver()
+    test_list_chart_indicators(kit)
     await test_ordering_and_shapes(kit)
+    await test_spoken_indicators(kit)
     await test_indicator_tool(kit)
     await test_empty_context(kit)
     await test_live(kit)
