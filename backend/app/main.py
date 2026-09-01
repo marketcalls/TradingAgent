@@ -38,6 +38,7 @@ from pydantic import BaseModel  # noqa: E402
 
 from .agent import build_agent  # noqa: E402
 from .openalgo.client import get_client  # noqa: E402
+from .routes.openalgo_proxy import router as openalgo_proxy_router  # noqa: E402
 from .openalgo.normalize import sanitize_text  # noqa: E402
 from .safety.audit import get_audit_log  # noqa: E402
 from .version import get_version  # noqa: E402
@@ -82,6 +83,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# The chart talks to OpenAlgo through here rather than directly, so the broker API
+# key never reaches the browser. OpenAlgo's own frontend does hand the key to the
+# page, but that app is same-origin with the broker API and this one is not.
+app.include_router(openalgo_proxy_router)
+
 USER_ID = "local"
 
 # Tools whose confirmation card should carry a priced preview.
@@ -98,6 +104,12 @@ class ChatRequest(BaseModel):
     trading_enabled: bool | None = None
     # "" or absent uses the .env default; otherwise none|minimal|low|medium|high.
     reasoning_effort: str | None = None
+    # The chart the user is looking at, sent by /charts and absent from the chat
+    # page. It reaches the tools through session_state, not the prompt: the
+    # interaction this page is modelled on names no symbol, exchange, interval or
+    # date, so all four are resolved from here. A model that has to ask which
+    # symbol is on screen has already lost the thread.
+    chart_context: dict[str, Any] | None = None
 
 
 class ConfirmRequest(BaseModel):
@@ -283,6 +295,17 @@ async def _pump(stream, request: Request, on_complete=None) -> AsyncIterator[str
                     "duration": getattr(getattr(t, "metrics", None), "duration", None),
                 })
 
+            elif name == "CustomEvent":
+                # Chart instructions, pushed from inside a generator tool while it
+                # is still running. This is why they are an event and not a tool
+                # result: the markup has to land on the chart before a word of the
+                # answer is written, and a tool result only reaches the browser
+                # once the tool returns. It also sidesteps the 12,000 character
+                # cap, which an envelope with thirty vertices would blow through.
+                commands = getattr(ev, "commands", None)
+                if commands:
+                    yield sse("chart_command", {"commands": commands})
+
             elif name == "ToolCallError":
                 t = getattr(ev, "tool", None)
                 tid = getattr(t, "tool_call_id", None)
@@ -397,6 +420,11 @@ async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
         "trading_enabled": (settings.trading_enabled
                             if req.trading_enabled is None else bool(req.trading_enabled)),
     }
+    if req.chart_context is not None:
+        # Read fresh on every turn rather than remembered: the user can change
+        # symbol or timeframe between questions, and the analyst must see the
+        # chart as it is now, not as it was when the session opened.
+        session_state["chart"] = req.chart_context
 
     def on_complete(sid: str) -> None:
         if is_new:

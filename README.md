@@ -3,6 +3,9 @@
 Trade Indian markets by typing what you want. Ask for a quote, an option chain, an indicator or
 a screen, and tell it to place the order.
 
+Two surfaces. **Chat** answers questions and places orders. **[Charts](#charts)** is a charting
+terminal with a technical analyst beside it that draws on the chart you are looking at.
+
 **Every order stops and asks you to approve it before anything reaches your broker.**
 
 Built on [Agno](https://docs.agno.com) with [OpenAlgo](https://docs.openalgo.in) as the broker
@@ -68,6 +71,51 @@ wrong.
 
 It knows OpenAlgo's symbol format, so "NIFTY 50" and "BANK NIFTY" resolve to the right
 instruments, and it looks option symbols up rather than guessing them.
+
+## Charts
+
+`/charts` is a charting terminal with an analyst beside it. Ask in plain words and it works on the
+chart in front of you.
+
+**It already knows what you are looking at.** The symbol, exchange, interval and visible range
+travel with every question, so there is nothing to repeat.
+
+- Draw the channel connecting the visible highs and lows
+- Add supertrend 3,10
+- What is the trend and momentum
+- Mark the support and resistance
+- Switch to the 15 minute
+- Project a target from that channel
+
+```
+You:   Draw the channel connecting the visible highs and lows
+
+       [two lines appear on the chart before a word is written]
+
+Agent: NIFTY - NSE, 1h
+       Upper rail  Rs 24,908.61 to Rs 24,222.22 across 5 swing highs
+       Lower rail  Rs 23,954.60 to Rs 24,076.85 across 3 swing lows
+       Structure   Contracting channel, right-edge width Rs 145.37
+
+       [Project a target]  [Clear the markup]
+```
+
+**The analyst does not decide where a line goes.** Swing pivots, slopes and levels are computed
+from the candles in Python and handed back as exact anchors. The model chooses what to draw and
+writes the caption around numbers it was given. It is the same rule the approval card follows,
+and for the same reason: a model reading 200 bars of OHLCV and inventing a swing high would look
+convincing and be wrong.
+
+**Nothing on this page can reach a broker.** The order tools are not registered for it at all, and
+the market data relay refuses the account order stream outright. Trading stays on the chat page,
+behind the approval gate.
+
+The chart is [openalgo-charts](https://www.npmjs.com/package/openalgo-charts): 102 indicators, 51
+drawing tools and 13 chart types, all of which you can drive by hand as well as by prompt. Live
+candles arrive over a websocket.
+
+Your OpenAlgo API key never reaches the browser. History and ticks both come through the backend,
+which injects the key server-side and strips any the page tries to send.
 
 ## Safety
 
@@ -164,7 +212,7 @@ cd frontend
 npm run dev
 ```
 
-Open **http://localhost:5173**.
+Open **http://localhost:5173** for chat, or **http://localhost:5173/charts** for the chart.
 
 Use `localhost`, not `127.0.0.1`: Vite binds the hostname only, so `http://127.0.0.1:5173` is
 refused even while the server is up.
@@ -220,6 +268,7 @@ releases.
 | Tailwind CSS | 4.3 | CSS-first: the theme lives in `@theme` in `src/index.css`, and there is no `tailwind.config.js` or PostCSS step |
 | react-markdown + remark-gfm | 10.1 / 4.0 | GFM tables, which most answers use |
 | lucide-react | 1.31 | Icons for UI chrome |
+| [openalgo-charts](https://www.npmjs.com/package/openalgo-charts) | 1.9.2 | The chart engine. Zero runtime dependencies, lazy tiers, canvas only: it ships no DOM, so every picker and dialog around it is this app's |
 
 ### Models
 
@@ -227,7 +276,8 @@ Any LiteLLM provider: Baseten, OpenAI, Anthropic, Gemini, Groq, OpenRouter, or a
 through Ollama with no API key. See [docs/model-notes.md](docs/model-notes.md).
 
 **43 tools** across 8 toolkits, covering 43 of OpenAlgo's endpoints. 13 of them can move money,
-and all 13 require your approval.
+and all 13 require your approval. The charts page adds a ninth toolkit of 14 chart tools, scoped
+so they exist only when a chart is open, and not one of them can place an order.
 
 ## Validate
 
@@ -241,6 +291,9 @@ python backend/tests/test_indicators.py
 python backend/tests/test_tools_orders.py
 python backend/tests/test_confirm_loop.py   # full approval round trip over HTTP
 python backend/tests/test_hitl_models.py    # the approval gate on every model
+python backend/tests/test_geometry.py       # swing pivots, channels, levels
+python backend/tests/test_tools_charts.py   # the chart tools, none of them gated
+python backend/tests/test_openalgo_proxy.py # the candle proxy and the tick relay
 ```
 
 The order tests refuse to run unless OpenAlgo reports analyzer mode, so they never place a real
@@ -257,10 +310,15 @@ backend/app/
   openalgo/           broker client, response handling, symbols, candle cache
   indicators/         127-indicator registry and dispatcher
   safety/             RiskGuard and the audit trail
-  tools/              8 toolkits, 43 tools
+  tools/              9 toolkits, 57 tools
+  charts/             the drawing contract, swing geometry, indicator catalogue
+  routes/             the OpenAlgo proxy: candles over REST, ticks over a socket
 frontend/src/
   components/         Sidebar, ModeBanner, Message, ToolTimeline,
                       ConfirmCard, DataTable, Composer, ThinkingSelector
+  components/charts/  toolbar, drawing rail, indicator dialogs, analyst panel
+  lib/charts/         the chart terminal, its feed, theme and annotations
+  pages/              ChartsPage
 docs/
   CHANGELOG.md        what changed, per version
   model-notes.md      choosing a model, and the provider bugs worked around
@@ -274,6 +332,8 @@ docs/
   provider bugs the agent works around automatically.
 - **[docs/CHANGELOG.md](docs/CHANGELOG.md)** - what changed in each version.
 - **[docs/plan/PLAN.md](docs/plan/PLAN.md)** - the design document.
+- **[docs/plan/PLAN-charts.md](docs/plan/PLAN-charts.md)** - the charts page and the analyst,
+  including what was measured about the chart engine before any of it was built.
 - **[docs/progress/](docs/progress/)** - each build iteration with its real validation output.
 
 ## Version

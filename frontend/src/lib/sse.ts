@@ -96,6 +96,21 @@ export interface NoticeEvent {
   message: string
 }
 
+/** Chart instructions from the analyst, applied the moment they arrive.
+ *
+ *  This is a separate frame rather than part of the answer for two reasons. The
+ *  markup has to land on the chart before a word of prose is written, which it
+ *  cannot do if it rides on the reply. And a response model would have silenced
+ *  the token stream entirely: agno 2.8.7 stops streaming content whenever
+ *  output_schema is set, so the shapes travel beside the prose, never inside it.
+ *
+ *  The payload is deliberately opaque here. Only the chart page knows what a
+ *  command means; every other consumer ignores the frame. */
+export interface ChartCommandEvent {
+  type: "chart_command"
+  commands: unknown[]
+}
+
 export type StreamEvent =
   | StartEvent
   | TokenEvent
@@ -105,6 +120,7 @@ export type StreamEvent =
   | DoneEvent
   | ErrorEvent
   | NoticeEvent
+  | ChartCommandEvent
 
 /** One tool call as the timeline accumulates it: opened by tool_start, closed by
  *  tool_end. A call with ok still undefined is still running. */
@@ -142,6 +158,13 @@ export interface ChatStreamBody {
   session_id?: string | null
   /** "" or omitted uses the server default; otherwise none|minimal|low|medium|high. */
   reasoning_effort?: string
+  /** The chart the user is looking at, when the request comes from /charts.
+   *
+   *  Ambient context, never asked for. The interaction this page is modelled on
+   *  supplies no symbol, exchange, interval or date in the prompt, so all four
+   *  are resolved from here or the feature does not work at all. Absent on the
+   *  chat page, where there is no chart. */
+  chart_context?: unknown
 }
 
 export interface ConfirmStreamBody {
