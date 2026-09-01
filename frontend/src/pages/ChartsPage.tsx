@@ -246,6 +246,14 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
         setExchange(sym.exchange)
         setName(sym.name ?? "")
       },
+      onViewChanged(view) {
+        // Fires when the analyst changes the view rather than the toolbar. Without
+        // it the interval control kept reading whatever it said at startup while
+        // the chart underneath had already reloaded at a different timeframe.
+        if (!alive) return
+        setBarInterval(view.interval)
+        setChartType(view.chartType)
+      },
       onWsState(state) {
         if (alive) setWsState(state)
       },

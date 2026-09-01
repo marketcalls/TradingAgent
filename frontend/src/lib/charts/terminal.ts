@@ -1166,6 +1166,7 @@ export class ChartTerminal implements TerminalApi {
     this.interval = interval
     this.store("interval", interval)
     this.buildLegend()
+    this.cb.onViewChanged({ interval: this.interval, chartType: this.chartTypeId })
     await this.reload()
   }
 
@@ -1179,6 +1180,7 @@ export class ChartTerminal implements TerminalApi {
     if (this.destroyed) return
     this.chartTypeId = def.value
     this.store("charttype", def.value)
+    this.cb.onViewChanged({ interval: this.interval, chartType: this.chartTypeId })
     // A series cannot change type in place, so this is the one action that
     // rebuilds. build() snapshots the drawings and re-applies everything else.
     this.build()

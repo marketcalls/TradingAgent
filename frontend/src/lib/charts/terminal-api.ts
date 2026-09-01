@@ -105,6 +105,12 @@ export type WsState =
 export interface TerminalCallbacks {
   onReady(info: { intervals: IntervalGroups; interval: string; chartType: string }): void
   onSymbolLoaded(sym: { symbol: string; exchange: string; name?: string }): void
+  /** The interval or chart type changed from inside the terminal.
+   *
+   *  onReady carries both, but it fires once at startup. When the analyst changes
+   *  either one the toolbar has no other way to hear about it, and it sat there
+   *  reading 1h over a chart that had already reloaded as daily. */
+  onViewChanged(view: { interval: string; chartType: string }): void
   onWsState(state: WsState): void
   onLastPrice(price: number): void
   onDrawState(state: DrawState): void
