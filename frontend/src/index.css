@@ -40,6 +40,12 @@
   --container-composer: 768px;
 
   --shadow-l: var(--app-shadow-l);
+
+  --color-chart-up: var(--chart-up);
+  --color-chart-down: var(--chart-down);
+  --color-chart-grid: var(--chart-grid);
+  --color-chart-axis: var(--chart-axis);
+  --color-chart-ai: var(--chart-ai);
 }
 
 /* v4 defaults an un-suffixed border to currentColor, which would repaint every
@@ -77,6 +83,18 @@
   --warn-soft: oklch(0.58 0.13 70 / 0.12);
   --warn-border: oklch(0.58 0.13 70 / 0.32);
   --app-shadow-l: 0 4px 4px -2px oklch(0 0 0 / 0.05), 0 4px 8px -2px oklch(0 0 0 / 0.04);
+
+  /* Chart colours are OPAQUE and separate from the palette above, deliberately.
+     Every other non-text colour in this app is an alpha overlay on one base, which
+     is what keeps light and dark structurally identical. A canvas cannot consume
+     that: it composites against whatever it is drawn over, not against the page,
+     so an alpha token paints a candle that changes shade as it crosses a grid
+     line. These five are solid values the chart engine can use directly. */
+  --chart-up: rgb(8 153 129);
+  --chart-down: rgb(224 71 62);
+  --chart-grid: rgb(238 241 246);
+  --chart-axis: rgb(91 100 114);
+  --chart-ai: rgb(41 98 255);
 }
 
 .dark {
@@ -100,6 +118,12 @@
   --warn-soft: oklch(0.85 0.12 82 / 0.12);
   --warn-border: oklch(0.85 0.12 82 / 0.32);
   --app-shadow-l: 0 4px 4px -2px oklch(0 0 0 / 0.1), 0 4px 8px -2px oklch(0 0 0 / 0.08);
+
+  --chart-up: rgb(38 166 154);
+  --chart-down: rgb(239 83 80);
+  --chart-grid: rgb(22 26 38);
+  --chart-axis: rgb(139 145 167);
+  --chart-ai: rgb(79 140 255);
 }
 
 html,

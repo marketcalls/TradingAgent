@@ -14,7 +14,9 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react"
-import Sidebar from "./components/Sidebar"
+import Sidebar, { type Route } from "./components/Sidebar"
+import { cn } from "./lib/format"
+import ChartsPage from "./pages/ChartsPage"
 import ModeBanner from "./components/ModeBanner"
 import ThinkingSelector from "./components/ThinkingSelector"
 import Message from "./components/Message"
@@ -40,6 +42,20 @@ import {
 } from "./lib/sse"
 
 const THEME_KEY = "oa-theme"
+
+/** Which surface a path selects.
+ *
+ *  Two surfaces, one shell, and no router: this app has never had one and a
+ *  routing library would be its only dependency of that kind. pushState plus
+ *  popstate covers both cases the app actually has.
+ *
+ *  One caveat worth knowing before deploying: Vite's dev server falls back to
+ *  index.html for an unknown path, so a deep link to /charts works in dev. A
+ *  plain static host will 404 on it and needs a rewrite rule. Navigating inside
+ *  the app is unaffected either way. */
+function routeOf(pathname: string): Route {
+  return pathname.startsWith("/charts") ? "charts" : "chat"
+}
 
 const STARTERS = [
   "What is my current P&L and which positions are open?",
@@ -74,6 +90,26 @@ export default function App() {
   const [model, setModel] = useState<string | null>(null)
   const [health, setHealth] = useState<string | null>(null)
   const [theme, setTheme] = useState<Theme>(readTheme)
+  const [route, setRoute] = useState<Route>(() => routeOf(window.location.pathname))
+
+  const chartsSeen = useRef(false)
+
+  // Back and forward have to work, so the browser owns the history and this
+  // only mirrors it.
+  useEffect(() => {
+    const onPop = () => setRoute(routeOf(window.location.pathname))
+    window.addEventListener("popstate", onPop)
+    return () => window.removeEventListener("popstate", onPop)
+  }, [])
+
+  const navigate = useCallback((next: Route) => {
+    window.history.pushState(null, "", next === "charts" ? "/charts" : "/")
+    setRoute(next)
+  }, [])
+
+  // Latches on the first visit and never resets. See the render comment.
+  const chartsMounted = route === "charts" || chartsSeen.current
+  chartsSeen.current = chartsMounted
 
   const runIdRef = useRef<string | null>(null)
   const sessionIdRef = useRef<string | null>(null)
@@ -367,6 +403,8 @@ export default function App() {
   return (
     <div className="flex h-full bg-background text-foreground">
       <Sidebar
+        route={route}
+        onNavigate={navigate}
         sessions={sessions}
         activeId={sessionId}
         busy={running}
@@ -378,7 +416,21 @@ export default function App() {
         onToggleTheme={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
       />
 
-      <div className="flex min-w-0 flex-1 flex-col">
+      {/* The chart is mounted on first visit and never unmounted after that.
+          Three things had to be true at once. Unmounting it would drop its
+          websocket and every drawing on it, so it cannot come and go with the
+          route. Mounting it at startup would build a chart inside a hidden
+          element, where the container measures 0x0 and the engine has nothing to
+          size itself against. And a user who never opens Charts should not pay
+          for a websocket they are not watching. Latching on first visit satisfies
+          all three: it is built once, while visible, and then only hidden. */}
+      {chartsMounted ? (
+        <div className={cn("min-w-0 flex-1", route === "charts" ? "flex" : "hidden")}>
+          <ChartsPage onNavigate={navigate} />
+        </div>
+      ) : null}
+
+      <div className={cn("min-w-0 flex-1 flex-col", route === "chat" ? "flex" : "hidden")}>
         <header className="flex items-center gap-3 border-b border-border px-4 py-2">
           <ModeBanner onMode={onMode} />
           {health ? <span className="truncate text-xs text-danger">{health}</span> : null}

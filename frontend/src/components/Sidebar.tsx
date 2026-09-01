@@ -1,14 +1,22 @@
-/** Thread list, new chat, delete, theme toggle and the model line.
+/** Surface nav, thread list, new chat, delete, theme toggle and the model line.
  *
  * The list is non-critical: a failed load leaves it empty rather than blocking the
  * chat, which is the only thing the user actually came for.
+ *
+ * The two surfaces sit above the threads because threads belong to the chat and
+ * not to the charts. Both stay mounted when you switch, so a half-written thread
+ * and a loaded chart both survive a look at the other one.
  */
 
-import { Moon, Plus, Sun, Trash2 } from "lucide-react"
+import { LineChart, MessageSquare, Moon, Plus, Sun, Trash2 } from "lucide-react"
 import type { SessionRow } from "../lib/api"
 import { cn, formatStamp } from "../lib/format"
 
+export type Route = "chat" | "charts"
+
 interface SidebarProps {
+  route: Route
+  onNavigate: (route: Route) => void
   sessions: SessionRow[]
   activeId: string | null
   busy: boolean
@@ -20,7 +28,14 @@ interface SidebarProps {
   onToggleTheme: () => void
 }
 
+const NAV = [
+  { route: "chat" as const, label: "Chat", icon: MessageSquare },
+  { route: "charts" as const, label: "Charts", icon: LineChart }
+]
+
 export default function Sidebar({
+  route,
+  onNavigate,
   sessions,
   activeId,
   busy,
@@ -38,7 +53,26 @@ export default function Sidebar({
         <span className="text-sm font-semibold">Trading Agent</span>
       </div>
 
-      <div className="px-3">
+      <div className="flex flex-col gap-0.5 px-3 pt-1">
+        {NAV.map((item) => (
+          <button
+            key={item.route}
+            type="button"
+            onClick={() => onNavigate(item.route)}
+            className={cn(
+              "flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm",
+              route === item.route
+                ? "bg-muted font-medium text-foreground"
+                : "text-muted-foreground hover:bg-muted hover:text-foreground"
+            )}
+          >
+            <item.icon className="h-4 w-4 shrink-0" />
+            {item.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="px-3 pt-3">
         <button
           type="button"
           onClick={onNewChat}

@@ -130,6 +130,21 @@ INSTRUCTIONS = [
     "If a tool returns no data, say so plainly. Never invent a price, a position, or an "
     "order id.",
 
+    # the chart, when one is open
+    "When a chart is open you are a technical analyst working on it. Its symbol, "
+    "exchange, interval and visible range are given to you: never ask the user which "
+    "instrument or timeframe they mean, and never make them repeat it.",
+    "You do not decide where a line goes. The drawing tools compute the geometry from "
+    "the bars and hand back exact anchors; you choose what to draw and describe what "
+    "came back. Never write a swing high, a level or a target you did not get from a "
+    "tool.",
+    "Name the instrument and timeframe back in your answer, and quote the anchor prices "
+    "the tool returned. That is how the user catches an answer about the wrong chart.",
+    "Keep a markup reply to a short heading and two or three labelled lines. It is a "
+    "caption for something the user can already see, not an essay.",
+    "A setting written as two numbers can be ambiguous. Apply the usual convention, "
+    "then say which reading you used so a wrong guess costs one short correction.",
+
     # boundary
     "You carry out instructions and provide analysis. You do not give personalised "
     "investment advice and you do not tell the user what they should buy or sell.",
@@ -163,6 +178,21 @@ def _options_read_toolkit(client=None):
         return OptionsTools(client=client, include_tools=OPTIONS_READ_ONLY)
     except ImportError:
         log.warning("options tools unavailable")
+        return None
+
+
+def _chart_toolkit(client=None, frames=None):
+    """The chart analyst's tools, loaded only for a request that has a chart.
+
+    Scoped the same way order tools are, and for the same reason: a tool the model
+    cannot use is a tool it can still pick wrongly. The chat page has no chart to
+    act on, so it never sees these fourteen.
+    """
+    try:
+        from .tools.charts import ChartTools
+        return ChartTools(client=client, frames=frames)
+    except ImportError:
+        log.warning("chart tools unavailable")
         return None
 
 
@@ -232,6 +262,12 @@ def build_tool_factory(settings: Settings):
     def get_tools(run_context: RunContext) -> list:
         kits = _read_only_toolkits(lean=lean)
         state = getattr(run_context, "session_state", None) or {}
+        # The charts page sends its chart with every turn. Its absence is what
+        # tells us this is the chat page, where there is nothing to draw on.
+        if state.get("chart"):
+            chart = _chart_toolkit()
+            if chart is not None:
+                kits.append(chart)
         session_allows = bool(state.get("trading_enabled", settings.trading_enabled))
         if settings.trading_enabled and session_allows:
             kits.extend(_order_toolkits(lean=lean))

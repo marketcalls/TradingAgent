@@ -8,12 +8,18 @@ import tailwindcss from "@tailwindcss/vite"
 // Every fetch in the app uses a bare relative /api path, so the dev server proxies to
 // the backend rather than the browser talking to it cross-origin. The port is
 // BACKEND_PORT from the repo .env; changing one without the other breaks dev only.
+//
+// ws:true is load-bearing for the chart. The live tick feed connects to
+// /api/oa/ws, and vite does not forward websocket upgrades unless asked: without
+// it the socket fails the handshake, the chart falls back to history only, and the
+// last candle simply never moves. That reads as a broken feed rather than a
+// misconfigured proxy, so it is worth the comment.
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     port: 5173,
     proxy: {
-      "/api": { target: "http://127.0.0.1:8088", changeOrigin: true }
+      "/api": { target: "http://127.0.0.1:8088", changeOrigin: true, ws: true }
     }
   }
 })
