@@ -5,7 +5,7 @@
  * icon is unambiguous. A roomy toolbar steals bars from the chart, which is the
  * thing the trader actually came to look at.
  *
- * Two rules shape the rest of it:
+ * Three rules shape the rest of it:
  *
  *   - A control with no data behind it is disabled with its state still
  *     readable, never hidden. Before the engine reports back there are no
@@ -18,6 +18,11 @@
  *     the two states the brief did not name get the reading they deserve:
  *     "open" is warn because a socket that carries no ticks is not live, and
  *     "closed" is muted because a deliberately closed feed is not a fault.
+ *   - The last price is not a prop. It ticks up to four times a second, and as
+ *     page state every tick re-rendered the whole page, the analyst column and
+ *     every markdown answer in it, hidden or not. The readout is a component of
+ *     its own that subscribes to the price through a callback and owns the only
+ *     state that changes on a tick, and it unsubscribes while the page is hidden.
  *
  * The menus are built here rather than pulled from a kit because this app has
  * no dialog or popover primitive. Each one closes on Escape and on a pointer
@@ -43,6 +48,11 @@ import { chartTypeIcon, type ChartIcon } from "./chartIcons"
 
 /** Mirrors the argument of `TerminalApi.setPriceScaleMode`. */
 export type PriceScaleMode = "linear" | "logarithmic" | "percentage" | "indexed-to-100"
+
+export type PriceListener = (price: number | null) => void
+/** Registers a listener for the last traded price. Called once with the current
+ *  value on subscribe, then on every tick. Returns the unsubscribe. */
+export type PriceSubscribe = (listener: PriceListener) => () => void
 
 const TOOLBAR_BUTTON =
   "flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1 text-xs hover:bg-muted disabled:opacity-50"
@@ -87,10 +97,17 @@ function Menu({ title, buttonLabel, icon: Icon, sections, value, disabled, onSel
   const buttonRef = useRef<HTMLButtonElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
 
+  const close = (returnFocus: boolean) => {
+    setOpen(false)
+    if (returnFocus) buttonRef.current?.focus()
+  }
+
   useEffect(() => {
     if (!open) return
     const onPointerDown = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
+      // Focus was moved into the list on open, so it has to go back to the
+      // trigger on every way out, or a click on the chart leaves it on nothing.
+      if (!rootRef.current?.contains(event.target as Node)) close(true)
     }
     document.addEventListener("pointerdown", onPointerDown)
     return () => document.removeEventListener("pointerdown", onPointerDown)
@@ -104,11 +121,6 @@ function Menu({ title, buttonLabel, icon: Icon, sections, value, disabled, onSel
     const first = list.querySelector<HTMLButtonElement>("[data-menu-item='true']")
     ;(current ?? first)?.focus()
   }, [open])
-
-  const close = (returnFocus: boolean) => {
-    setOpen(false)
-    if (returnFocus) buttonRef.current?.focus()
-  }
 
   const step = (delta: number) => {
     const list = listRef.current
@@ -170,8 +182,13 @@ function Menu({ title, buttonLabel, icon: Icon, sections, value, disabled, onSel
           className="scroll-thin absolute left-0 top-full z-40 mt-1 max-h-[60vh] w-52 overflow-y-auto rounded-xl border border-border bg-background p-1 shadow-l"
         >
           {sections.map((section) => (
-            <div key={section.label} className="mb-1 last:mb-0">
-              <div className="px-2 py-1 text-[11px] uppercase tracking-wide text-muted-foreground">
+            // A menu's children must be items, groups or separators. The visible
+            // header is decoration: the group's label carries the same text.
+            <div key={section.label} role="group" aria-label={section.label} className="mb-1 last:mb-0">
+              <div
+                aria-hidden="true"
+                className="px-2 py-1 text-[11px] uppercase tracking-wide text-muted-foreground"
+              >
                 {section.label}
               </div>
               {section.items.map((item) => {
@@ -207,6 +224,27 @@ function Menu({ title, buttonLabel, icon: Icon, sections, value, disabled, onSel
   )
 }
 
+/** The last traded price, and the only thing on the page that renders per tick.
+ *  While the page is hidden it is unsubscribed; the subscribe call replays the
+ *  current value when it comes back, so nothing is missed. */
+function PriceReadout({ subscribe, active }: { subscribe: PriceSubscribe; active: boolean }) {
+  const [price, setPrice] = useState<number | null>(null)
+
+  useEffect(() => {
+    if (!active) return
+    return subscribe(setPrice)
+  }, [subscribe, active])
+
+  return (
+    <span
+      className="text-sm font-medium tabular-nums"
+      title={price === null ? "No trade yet" : "Last traded price"}
+    >
+      {price === null ? EMPTY : formatPrice(price)}
+    </span>
+  )
+}
+
 function feedTone(state: WsState): { tone: string; icon: ChartIcon; busy: boolean } {
   switch (state) {
     case "live":
@@ -235,7 +273,10 @@ interface ChartToolbarProps {
   chartType: string
   chartTypes?: ChartTypeOption[]
   wsState: WsState
-  lastPrice?: number | null
+  /** The price feed, see the header. Must be referentially stable. */
+  subscribePrice: PriceSubscribe
+  /** False while /charts is mounted but hidden; the readout then stops ticking. */
+  active: boolean
   volumeVisible: boolean
   priceScaleMode: PriceScaleMode
   onOpenSymbolSearch: () => void
@@ -256,7 +297,8 @@ export default function ChartToolbar({
   chartType,
   chartTypes,
   wsState,
-  lastPrice,
+  subscribePrice,
+  active,
   volumeVisible,
   priceScaleMode,
   onOpenSymbolSearch,
@@ -321,7 +363,8 @@ export default function ChartToolbar({
 
       <Menu
         title="Chart type"
-        buttonLabel={activeType?.label ?? chartType ?? EMPTY}
+        // chartType is "" before onReady, and "" ?? EMPTY is still "".
+        buttonLabel={activeType?.label || chartType || EMPTY}
         icon={TypeIcon}
         sections={typeSections}
         value={chartType}
@@ -335,12 +378,7 @@ export default function ChartToolbar({
       </button>
 
       <div className="ml-auto flex items-center gap-2">
-        <span
-          className="text-sm font-medium tabular-nums"
-          title={lastPrice === null || lastPrice === undefined ? "No trade yet" : "Last traded price"}
-        >
-          {lastPrice === null || lastPrice === undefined ? EMPTY : formatPrice(lastPrice)}
-        </span>
+        <PriceReadout subscribe={subscribePrice} active={active} />
 
         <span
           role="status"

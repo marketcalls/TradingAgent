@@ -14,10 +14,22 @@ Streaming facts verified against agno 2.8.7:
   - ToolCallCompleted fires with tool_call_error=True and is then followed by a
     separate ToolCallError, so the second is suppressed to avoid double counting.
   - A cancelled run still emits a trailing RunCompleted, so RunCancelled is terminal.
+  - session_state is DEEP-MERGED over the stored copy on every run
+    (agno.utils.merge_dict.merge_dictionaries, run values winning). A key the
+    request leaves out therefore persists from the previous turn, while a key sent
+    as None overrides. That is why a chat turn sends chart=None explicitly instead
+    of omitting it: a session that once carried a chart would otherwise keep it, and
+    the chat page would load the chart tools for a chart it cannot show.
+
+Anything that talks to the broker through the synchronous SDK goes through
+asyncio.to_thread, the health and mode polls included: they are hit every few
+seconds by the UI, and a synchronous call there stalls every stream in flight
+behind one broker round trip.
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import re
@@ -381,7 +393,12 @@ SSE_HEADERS = {
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    ping = client.ping()
+    """Liveness for the UI banner, with the broker ping taken off the event loop.
+
+    Returns:
+        Version, model, missing keys, whether OpenAlgo answered and which broker.
+    """
+    ping = await asyncio.to_thread(client.ping)
     return {
         "ok": True,
         "version": get_version(),
@@ -395,7 +412,13 @@ async def health() -> dict[str, Any]:
 
 @app.get("/api/mode")
 async def mode() -> dict[str, Any]:
-    m = client.analyzer_mode()
+    """Trading mode and capability flags for the UI, polled every few seconds.
+
+    Returns:
+        The analyzer mode, whether orders are real, the safety switches, and what
+        reasoning control the configured model offers.
+    """
+    m = await asyncio.to_thread(client.analyzer_mode)
     return {
         "mode": m,
         "orders_are_real": m == "live",
@@ -411,20 +434,34 @@ async def mode() -> dict[str, Any]:
     }
 
 
+def _session_state_for(req: ChatRequest) -> dict[str, Any]:
+    """The per-turn session_state a chat request contributes.
+
+    "chart" is ALWAYS present. The charts page sends its chart with every turn, read
+    fresh rather than remembered, because the user can change symbol or timeframe
+    between questions. The chat page sends none, and that has to reach agno as an
+    explicit None: session_state is deep-merged over the stored copy, so a key that
+    is merely absent would leave a chart from an earlier turn in place, and the chat
+    page would silently discard the drawing commands the analyst then produced.
+
+    Args:
+        req: The incoming chat request.
+
+    Returns:
+        A session_state dict with trading_enabled and chart set.
+    """
+    return {
+        "trading_enabled": (settings.trading_enabled
+                            if req.trading_enabled is None else bool(req.trading_enabled)),
+        "chart": req.chart_context or None,
+    }
+
+
 @app.post("/api/chat/stream")
 async def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
     session_id = req.session_id or None
     is_new = session_id is None
-
-    session_state = {
-        "trading_enabled": (settings.trading_enabled
-                            if req.trading_enabled is None else bool(req.trading_enabled)),
-    }
-    if req.chart_context is not None:
-        # Read fresh on every turn rather than remembered: the user can change
-        # symbol or timeframe between questions, and the analyst must see the
-        # chart as it is now, not as it was when the session opened.
-        session_state["chart"] = req.chart_context
+    session_state = _session_state_for(req)
 
     def on_complete(sid: str) -> None:
         if is_new:

@@ -72,7 +72,11 @@ export interface DrawState {
   canUndo: boolean
   canRedo: boolean
   magnet: boolean
+  /** Every drawing on the chart, the user's and the analyst's. */
   count: number
+  /** The analyst's drawings only. The clear button acts on these and must not
+   *  claim to clear "every drawing" when it leaves the user's alone. */
+  aiCount?: number
 }
 
 /** The currently selected drawing, or null. */

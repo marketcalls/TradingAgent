@@ -27,6 +27,14 @@
  *   - The OHLC readout is a DOM node the terminal writes into directly, passed as
  *     legendEl. Routing the crosshair through setState would re-render this page
  *     on every pointer move.
+ *   - The last price is not page state either. It ticks up to four times a
+ *     second, and as state here every tick re-rendered the analyst column and
+ *     re-parsed every markdown answer in it. The toolbar's readout subscribes
+ *     through a callback and owns the only state that changes on a tick.
+ *   - The interval and chart type in the toolbar are set from onViewChanged
+ *     alone, never optimistically in the click handler. The terminal can refuse
+ *     an interval the broker does not offer, and a toolbar that had already
+ *     switched was then lying over a chart that had not.
  *
  * How an analyst command reaches the canvas: useAgentStream calls onChartCommand
  * when a chart_command frame lands, and each command is chained onto a single
@@ -34,19 +42,32 @@
  * things at once. Commands can never interleave with each other, and a command
  * that arrives while the first history fetch is still in flight waits for the
  * chart instead of being dropped. The queue is rebuilt on every mount, so the
- * StrictMode double-mount cannot leave work chained behind a destroyed chart.
+ * StrictMode double-mount cannot leave work chained behind a destroyed chart,
+ * and a continuation checks it is still talking to the terminal it was queued
+ * for before it touches one. Every link, init included, is held to a timeout:
+ * a serial chain with no timeout is poisoned by one stalled fetch, and every
+ * command in every later turn then waits behind it for ever.
  *
  * Markup is applied the moment its frame lands, before a word of prose. The two
  * are independent streams and the panel is always the slower of them.
+ *
+ * The page also keeps two things the analyst column cannot, because the column
+ * unmounts when it is collapsed: the per-turn "Thought for" readings, and the
+ * view generation. The generation counts symbol and view changes, and the chips
+ * that act on "the structure you just drew" are withheld once the chart has
+ * moved on from the one they were drawn on.
  *
  * Persistence uses the app's "oa-" prefix scoped to "oa-charts-". Not
  * "oa-trading-", which is OpenAlgo's own namespace for the same nine keys, and
  * sharing it would have the two applications clobber each other's layout.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { PanelRightOpen } from "lucide-react"
-import ChartToolbar from "../components/charts/ChartToolbar"
+import ChartToolbar, {
+  type PriceListener,
+  type PriceSubscribe
+} from "../components/charts/ChartToolbar"
 import SymbolSearchDialog from "../components/charts/SymbolSearchDialog"
 import DrawingRail from "../components/charts/DrawingRail"
 import DrawingStyleBar from "../components/charts/DrawingStyleBar"
@@ -68,6 +89,7 @@ import type {
   WsState
 } from "../lib/charts/terminal-api"
 import type { ChartCommand, ChartIndicator } from "../lib/charts/types"
+import type { ChatMessage } from "../lib/sse"
 import { useAgentStream } from "../lib/useAgentStream"
 import { describeError } from "../lib/api"
 import { cn } from "../lib/format"
@@ -78,11 +100,16 @@ const PANEL_KEY = "oa-charts-panel"
 const VOLUME_KEY = "oa-charts-volume"
 const SCALE_KEY = "oa-charts-price-scale"
 
+/** How long one link of the command chain may take before the chain moves on.
+ *  Generous, because a symbol change is a history fetch; not unbounded, because
+ *  the chain is serial and one stalled link holds every later one. */
+const COMMAND_TIMEOUT_MS = 20_000
+
 type PriceScaleMode = Parameters<TerminalApi["setPriceScaleMode"]>[0]
 type DrawToolGroups = ReturnType<TerminalApi["drawTools"]>
 
 /** An open label editor. `placed` marks a drawing the user just created and has
- *  not named yet, which is the only case where cancelling removes it. */
+ *  not named yet, which is the only case where an empty commit removes it. */
 interface TextEdit {
   id: string
   text: string
@@ -106,13 +133,69 @@ const EMPTY_DRAW_STATE: DrawState = {
   count: 0
 }
 
+/** Settles as `work` does, or rejects once `ms` has passed. A late settlement
+ *  of `work` is then observed and discarded, never surfaced twice. */
+function withTimeout<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(
+      () => reject(new Error(`${what} did not finish within ${Math.round(ms / 1000)}s`)),
+      ms
+    )
+    work.then(
+      (value) => {
+        window.clearTimeout(timer)
+        resolve(value)
+      },
+      (error: unknown) => {
+        window.clearTimeout(timer)
+        reject(error)
+      }
+    )
+  })
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value)
+}
+
 /** The stream hands commands over as unknown[], because lib/sse.ts describes the
- *  frame and not this page's vocabulary. Shape is checked here and the op is not:
- *  the terminal ignores an op it does not know, so enumerating them at this
- *  boundary would only add a second place to forget one. */
+ *  frame and not this page's vocabulary. Each op's required fields are checked
+ *  here, because a frame with a known op and a missing field reached the engine
+ *  and the raw TypeError was toasted at the user. A frame that fails is dropped
+ *  with a console.warn, and an op this build does not know is treated the same:
+ *  the terminal would ignore it, and the warning says why nothing happened. */
 function isChartCommand(value: unknown): value is ChartCommand {
   if (!value || typeof value !== "object") return false
-  return typeof (value as { op?: unknown }).op === "string"
+  const candidate = value as Record<string, unknown>
+  switch (candidate.op) {
+    case "draw":
+      return typeof candidate.group === "string" && Array.isArray(candidate.shapes)
+    case "clear":
+      return candidate.group === undefined || typeof candidate.group === "string"
+    case "set_symbol":
+      return typeof candidate.symbol === "string" && typeof candidate.exchange === "string"
+    case "set_interval":
+      return typeof candidate.interval === "string"
+    case "set_chart_type":
+      return typeof candidate.chartType === "string"
+    case "add_indicator":
+      return typeof candidate.indicatorId === "string"
+    case "remove_indicator":
+      return typeof candidate.instanceId === "string" || typeof candidate.indicatorId === "string"
+    case "focus":
+      return isFiniteNumber(candidate.from) && isFiniteNumber(candidate.to)
+    default:
+      return false
+  }
+}
+
+/** Found by scanning back rather than taking length - 1, so the timing survives
+ *  a hook that appends the user turn without an empty assistant turn beside it. */
+function lastAssistantIndex(messages: ChatMessage[]): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === "assistant") return index
+  }
+  return -1
 }
 
 /** The theme is a class on <html>, exactly as App.tsx sets it. */
@@ -153,9 +236,12 @@ interface ChartsPageProps {
    *  that would navigate are not offered rather than being offered and dead.
    *  App.tsx's own `navigate` is exactly this shape and can be passed verbatim. */
   onNavigate?: (target: Route) => void
+  /** False while the host keeps this page mounted but hidden. Keyboard
+   *  shortcuts and the price readout stand down until it is shown again. */
+  active?: boolean
 }
 
-export default function ChartsPage({ onNavigate }: ChartsPageProps) {
+export default function ChartsPage({ onNavigate, active = true }: ChartsPageProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const legendRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<TerminalApi | null>(null)
@@ -163,6 +249,7 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
   /** One chain for every analyst command, rooted at init(). See the header. */
   const queueRef = useRef<Promise<void>>(Promise.resolve())
 
+  const [chartReady, setChartReady] = useState(false)
   const [symbol, setSymbol] = useState("")
   const [exchange, setExchange] = useState("")
   const [name, setName] = useState("")
@@ -171,7 +258,11 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
   const [chartType, setChartType] = useState("")
   const [chartTypes, setChartTypes] = useState<ChartTypeOption[]>([])
   const [wsState, setWsState] = useState<WsState>("connecting")
-  const [lastPrice, setLastPrice] = useState<number | null>(null)
+
+  // Bumped on every symbol load and view change. The chips born from a turn
+  // remember the generation they were born at; see the header.
+  const [viewGeneration, setViewGeneration] = useState(0)
+  const generationRef = useRef(0)
 
   const [volumeVisible, setVolumeVisible] = useState(() => readFlag(VOLUME_KEY, true))
   const [priceScaleMode, setPriceScaleMode] = useState<PriceScaleMode>(readScaleMode)
@@ -189,6 +280,18 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
 
   const [panelOpen, setPanelOpen] = useState(() => readFlag(PANEL_KEY, true))
   const [toast, setToast] = useState<{ message: string; tone: "info" | "error" } | null>(null)
+
+  // The price never enters this component's state. The terminal writes it to
+  // a ref and forwards it to whichever readout is currently subscribed.
+  const lastPriceRef = useRef<number | null>(null)
+  const priceListenerRef = useRef<PriceListener | null>(null)
+  const subscribePrice = useCallback<PriceSubscribe>((listener) => {
+    priceListenerRef.current = listener
+    listener(lastPriceRef.current)
+    return () => {
+      if (priceListenerRef.current === listener) priceListenerRef.current = null
+    }
+  }, [])
 
   // The ready payload carries neither the volume flag nor the price scale mode, so
   // the page asserts its own remembered values once the chart exists rather than
@@ -224,6 +327,11 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
     if (!container || !legendEl) return
     let alive = true
 
+    const bumpGeneration = () => {
+      generationRef.current += 1
+      setViewGeneration(generationRef.current)
+    }
+
     // Annotated rather than inferred from the constructor, so this bag keeps its
     // types while terminal.ts is still being written beside it.
     const callbacks: TerminalCallbacks = {
@@ -232,6 +340,7 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
         setIntervals(info.intervals)
         setBarInterval(info.interval)
         setChartType(info.chartType)
+        setChartReady(true)
         // Read through the ref: the local is still undefined in this body.
         const api = terminalRef.current
         if (!api) return
@@ -245,20 +354,24 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
         setSymbol(sym.symbol)
         setExchange(sym.exchange)
         setName(sym.name ?? "")
+        bumpGeneration()
       },
       onViewChanged(view) {
-        // Fires when the analyst changes the view rather than the toolbar. Without
-        // it the interval control kept reading whatever it said at startup while
-        // the chart underneath had already reloaded at a different timeframe.
+        // Fires on every interval or chart type change, whether the toolbar or
+        // the analyst asked for it, and only once the terminal has accepted it.
+        // It is the only place the toolbar's interval and type are set.
         if (!alive) return
         setBarInterval(view.interval)
         setChartType(view.chartType)
+        bumpGeneration()
       },
       onWsState(state) {
         if (alive) setWsState(state)
       },
       onLastPrice(price) {
-        if (alive) setLastPrice(price)
+        if (!alive) return
+        lastPriceRef.current = price
+        priceListenerRef.current?.(price)
       },
       onDrawState(state) {
         if (alive) setDrawState(state)
@@ -267,7 +380,7 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
         if (alive) setDrawSelection(selection)
       },
       onDrawTextEdit(request) {
-        // A text tool that was just placed and is still empty. Cancelling it
+        // A text tool that was just placed and is still empty. Leaving it empty
         // removes the drawing, because an empty label is invisible clutter the
         // user cannot then select to delete.
         if (alive) setTextEdit({ id: request.id, text: request.text, placed: true })
@@ -293,10 +406,14 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
 
     terminalRef.current = terminal
     // The queue is rooted at init so a command that arrives during the first
-    // history fetch waits for the chart instead of being dropped.
-    queueRef.current = terminal.init().catch((error: unknown) => {
-      if (alive) setToast({ message: describeError(error), tone: "error" })
-    })
+    // history fetch waits for the chart instead of being dropped. Held to the
+    // same timeout as a command: a stalled config or intervals fetch otherwise
+    // held every command of every turn behind it.
+    queueRef.current = withTimeout(terminal.init(), COMMAND_TIMEOUT_MS, "loading the chart").catch(
+      (error: unknown) => {
+        if (alive) setToast({ message: describeError(error), tone: "error" })
+      }
+    )
 
     return () => {
       alive = false
@@ -322,17 +439,28 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
   }, [toast])
 
   const onChartCommand = useCallback((commands: unknown[]) => {
-    const batch = commands.filter(isChartCommand)
+    const batch: ChartCommand[] = []
+    for (const command of commands) {
+      if (isChartCommand(command)) batch.push(command)
+      else console.warn("chart_command dropped: malformed frame", command)
+    }
     if (batch.length === 0) return
+    // The continuation runs later, possibly after a remount has replaced the
+    // terminal. It is bound to the instance it was queued for, and steps aside
+    // if the ref now names another one.
+    const owner = terminalRef.current
+    if (!owner) return
     queueRef.current = queueRef.current.then(async () => {
       for (const command of batch) {
-        const api = terminalRef.current
-        if (!api) return
+        if (terminalRef.current !== owner) return
         try {
-          await api.apply(command)
+          await withTimeout(owner.apply(command), COMMAND_TIMEOUT_MS, `the ${command.op} command`)
         } catch (error) {
-          // One bad op must not stall the rest of the batch or poison the chain.
-          if (aliveRef.current) setToast({ message: describeError(error), tone: "error" })
+          // One bad or stalled op must not stall the rest of the batch or poison
+          // the chain: a timeout is caught here exactly like a rejection.
+          if (aliveRef.current && terminalRef.current === owner) {
+            setToast({ message: describeError(error), tone: "error" })
+          }
         }
       }
     })
@@ -343,6 +471,59 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
   const context = useCallback(() => terminalRef.current?.context() ?? null, [])
 
   const stream = useAgentStream({ onChartCommand, context })
+
+  // Read through a ref so the callback the panel receives never changes and the
+  // panel's memo holds. The hook's send is itself stable, but this does not
+  // depend on that staying true.
+  const sendRef = useRef(stream.send)
+  sendRef.current = stream.send
+  const handleSend = useCallback((text: string) => {
+    void sendRef.current(text)
+  }, [])
+
+  const handleCollapse = useCallback(() => setPanelOpen(false), [])
+
+  // The "Thought for" clock. Started on the first sign of a run, stopped when
+  // the answer begins or the run ends without one, kept per turn index so a
+  // finished turn goes on showing its own reading once the next one starts.
+  // It lives here and not in the panel because the panel unmounts on collapse.
+  const lastAssistant = useMemo(() => lastAssistantIndex(stream.messages), [stream.messages])
+  const answered = lastAssistant >= 0 && Boolean(stream.messages[lastAssistant].content)
+  const startedRef = useRef<number | null>(null)
+  const [seconds, setSeconds] = useState<Record<number, number>>({})
+
+  useEffect(() => {
+    if (stream.running && startedRef.current === null) startedRef.current = Date.now()
+  }, [stream.running])
+
+  useEffect(() => {
+    const started = startedRef.current
+    if (started === null) return
+    if (stream.running && !answered) return
+    startedRef.current = null
+    if (lastAssistant < 0) return
+    const elapsed = Math.max(0, Math.round((Date.now() - started) / 1000))
+    setSeconds((current) =>
+      current[lastAssistant] === undefined ? { ...current, [lastAssistant]: elapsed } : current
+    )
+  }, [stream.running, answered, lastAssistant])
+
+  // A new thread drops every measurement with the transcript it belonged to.
+  useEffect(() => {
+    if (stream.messages.length === 0) {
+      startedRef.current = null
+      setSeconds({})
+    }
+  }, [stream.messages.length])
+
+  // The chips born from a finished turn belong to the view as it was when the
+  // run ended. Once the chart moves on, "project a target from the structure
+  // you just drew" is about a chart the user is no longer looking at.
+  const [chipGeneration, setChipGeneration] = useState(0)
+  useEffect(() => {
+    if (!stream.running) setChipGeneration(generationRef.current)
+  }, [stream.running])
+  const chipsStale = chipGeneration !== viewGeneration
 
   const handleSearch = useCallback(
     (query: string, withinExchange?: string) =>
@@ -359,10 +540,11 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
     })
   }, [])
 
+  // Neither handler touches the toolbar's state: onViewChanged does, once the
+  // terminal has accepted the change. See the header.
   const handleInterval = useCallback((next: string) => {
     const api = terminalRef.current
     if (!api) return
-    setBarInterval(next)
     void api.setInterval(next).catch((error: unknown) => {
       if (aliveRef.current) setToast({ message: describeError(error), tone: "error" })
     })
@@ -371,7 +553,6 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
   const handleChartType = useCallback((next: string) => {
     const api = terminalRef.current
     if (!api) return
-    setChartType(next)
     void api.setChartType(next).catch((error: unknown) => {
       if (aliveRef.current) setToast({ message: describeError(error), tone: "error" })
     })
@@ -457,13 +638,21 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
   }, [drawSelection])
 
   // The style bar's edit path has no way to read the label back off the chart, so
-  // the field opens empty and saving replaces whatever was there.
+  // the field opens empty. Saving text replaces whatever was there; saving
+  // nothing keeps it, since an existing label has text worth keeping.
   const handleEditText = useCallback(() => {
     if (!drawSelection) return
     setTextEdit({ id: drawSelection.id, text: "", placed: false })
   }, [drawSelection])
 
-  const commitText = useCallback((id: string, text: string) => {
+  const commitText = useCallback((id: string, text: string, placed: boolean) => {
+    if (text.trim().length === 0) {
+      // An empty label is invisible and cannot be hit to delete. A drawing
+      // that was just placed goes; an existing one keeps the text it had.
+      if (placed) terminalRef.current?.removeDrawing(id)
+      setTextEdit(null)
+      return
+    }
     terminalRef.current?.updateDrawing(id, { text })
     setTextEdit(null)
   }, [])
@@ -484,7 +673,8 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
         chartType={chartType}
         chartTypes={chartTypes}
         wsState={wsState}
-        lastPrice={lastPrice}
+        subscribePrice={subscribePrice}
+        active={active}
         volumeVisible={volumeVisible}
         priceScaleMode={priceScaleMode}
         onOpenSymbolSearch={() => setSearchOpen(true)}
@@ -500,6 +690,7 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
         <DrawingRail
           groups={drawGroups}
           state={drawState}
+          active={active}
           onPickTool={handlePickTool}
           onUndo={() => terminalRef.current?.undo()}
           onRedo={() => terminalRef.current?.redo()}
@@ -544,7 +735,7 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
                   setTextEdit((current) => (current ? { ...current, text: next } : current))
                 }}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter") commitText(textEdit.id, textEdit.text)
+                  if (event.key === "Enter") commitText(textEdit.id, textEdit.text, textEdit.placed)
                   if (event.key === "Escape") cancelText(textEdit.id, textEdit.placed)
                 }}
                 className="mt-1 w-full rounded-lg border border-input bg-background px-2 py-1 text-sm outline-none focus:border-primary"
@@ -559,7 +750,7 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
                 </button>
                 <button
                   type="button"
-                  onClick={() => commitText(textEdit.id, textEdit.text)}
+                  onClick={() => commitText(textEdit.id, textEdit.text, textEdit.placed)}
                   className="rounded-lg bg-primary px-2.5 py-1 text-xs text-primary-foreground"
                 >
                   Save
@@ -570,6 +761,8 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
 
           {toast ? (
             <div
+              role={toast.tone === "error" ? "alert" : "status"}
+              aria-live={toast.tone === "error" ? "assertive" : "polite"}
               className={cn(
                 "absolute bottom-10 left-1/2 z-30 -translate-x-1/2 rounded-lg border bg-background px-3 py-1.5 text-xs shadow-l",
                 toast.tone === "error" ? "border-danger-border text-danger" : "border-border text-muted-foreground"
@@ -584,12 +777,16 @@ export default function ChartsPage({ onNavigate }: ChartsPageProps) {
           <AnalystPanel
             messages={stream.messages}
             running={stream.running}
+            ready={chartReady}
             symbol={symbol}
             interval={interval}
-            onSend={(text) => void stream.send(text)}
+            lastAssistant={lastAssistant}
+            seconds={seconds}
+            chipsStale={chipsStale}
+            onSend={handleSend}
             onStop={stream.stop}
             onReset={stream.reset}
-            onCollapse={() => setPanelOpen(false)}
+            onCollapse={handleCollapse}
             onNavigate={onNavigate}
           />
         ) : (

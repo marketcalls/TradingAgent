@@ -7,6 +7,11 @@
  *
  * Keyboard rules, in the order they matter:
  *
+ *   - Nothing at all while /charts is hidden. The page stays mounted behind the
+ *     chat page with display:none, and a window listener does not know that:
+ *     Alt+H armed a drawing tool from the chat page and Escape there disarmed
+ *     it. The host says whether the page is showing, and the listener is not
+ *     installed while it is not.
  *   - Escape closes an open flyout; with no flyout open it disarms the tool and
  *     hands the pointer back to the chart. That is the escape hatch a user
  *     reaches for when a half-drawn trendline is following the cursor.
@@ -17,13 +22,21 @@
  *     contenteditable. The composer is one Tab away and stealing H from someone
  *     typing "short" is unforgivable.
  *
+ * The flyout is portalled to the body at a fixed viewport position, because an
+ * absolutely positioned child of the scrolling rail is clipped to a 28px
+ * sliver. The position is measured once when it opens, so a rail scroll or a
+ * window resize would strand it beside nothing; both close it instead. Focus
+ * moves into the flyout on open and back to the group's own button on Escape
+ * and on a pick, so a keyboard user is never dropped on the body.
+ *
  * The undo, redo and clear buttons are disabled from the engine's own counters
  * rather than hidden, so an empty chart still shows the whole rail: a control
  * with nothing to act on reads as "nothing to undo", a missing one reads as a
- * broken build.
+ * broken build. Clear acts on the analyst's drawings only, and says so.
  */
 
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -94,6 +107,8 @@ interface DrawingRailProps {
   groups?: DrawGroup[]
   /** Null until the engine has reported once. The rail still renders, disabled. */
   state?: DrawState | null
+  /** False while /charts is mounted but hidden. See the header. */
+  active?: boolean
   onPickTool: (toolId: string | null) => void
   onUndo: () => void
   onRedo: () => void
@@ -104,6 +119,7 @@ interface DrawingRailProps {
 export default function DrawingRail({
   groups,
   state,
+  active = true,
   onPickTool,
   onUndo,
   onRedo,
@@ -117,7 +133,10 @@ export default function DrawingRail({
   // looked right on a fresh load, before the rail had enough tools to scroll.
   const [anchor, setAnchor] = useState<{ top: number; left: number } | null>(null)
   const railRef = useRef<HTMLDivElement>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
   const flyoutRef = useRef<HTMLDivElement>(null)
+  /** Each group's own button, so focus has somewhere to go back to. */
+  const triggerRefs = useRef(new Map<string, HTMLButtonElement>())
 
   const list = useMemo(() => groups ?? [], [groups])
   const draw = state ?? IDLE
@@ -132,6 +151,15 @@ export default function DrawingRail({
     [list]
   )
 
+  const closeFlyout = useCallback(
+    (returnFocus: boolean) => {
+      if (returnFocus && openGroup) triggerRefs.current.get(openGroup)?.focus()
+      setOpenGroup(null)
+      setAnchor(null)
+    },
+    [openGroup]
+  )
+
   useEffect(() => {
     if (!openGroup) return
     const onPointerDown = (event: PointerEvent) => {
@@ -140,12 +168,25 @@ export default function DrawingRail({
       // Without this second test a pointerdown on a tool closed the menu before its
       // click landed, and picking a tool did nothing at all.
       if (railRef.current?.contains(target) || flyoutRef.current?.contains(target)) return
-      setOpenGroup(null)
-      setAnchor(null)
+      closeFlyout(false)
     }
     document.addEventListener("pointerdown", onPointerDown)
     return () => document.removeEventListener("pointerdown", onPointerDown)
-  }, [openGroup])
+  }, [openGroup, closeFlyout])
+
+  // The anchor was measured when the flyout opened. Anything that moves the
+  // trigger afterwards would leave the menu floating beside nothing.
+  useEffect(() => {
+    if (!openGroup) return
+    const scroller = scrollRef.current
+    const close = () => closeFlyout(false)
+    scroller?.addEventListener("scroll", close, { passive: true })
+    window.addEventListener("resize", close)
+    return () => {
+      scroller?.removeEventListener("scroll", close)
+      window.removeEventListener("resize", close)
+    }
+  }, [openGroup, closeFlyout])
 
   useEffect(() => {
     if (!openGroup) return
@@ -153,21 +194,26 @@ export default function DrawingRail({
   }, [openGroup])
 
   useEffect(() => {
+    // Not installed at all while the page is hidden: see the header.
+    if (!active) return
     const onKeyDown = (event: KeyboardEvent) => {
       if (isEditing()) return
       if (event.key === "Escape") {
         if (openGroup) {
-          setAnchor(null)
-          setOpenGroup(null)
+          closeFlyout(true)
           return
         }
         if (draw.activeTool) onPickTool(null)
         return
       }
+      // Alt+H and Alt+V are the draw tier's tool shortcuts, and they were also the
+      // engine's own grid toggles, so one keystroke armed a tool and flipped the
+      // grid. The grid toggles are disabled in the terminal's createChart
+      // shortcuts for that reason; this handler is the only one left listening.
       for (const entry of shortcuts) {
         if (shortcutMatches(entry.shortcut, event)) {
           event.preventDefault()
-          setOpenGroup(null)
+          if (openGroup) closeFlyout(true)
           onPickTool(entry.id)
           return
         }
@@ -175,7 +221,7 @@ export default function DrawingRail({
     }
     window.addEventListener("keydown", onKeyDown)
     return () => window.removeEventListener("keydown", onKeyDown)
-  }, [openGroup, draw.activeTool, shortcuts, onPickTool])
+  }, [active, openGroup, draw.activeTool, shortcuts, onPickTool, closeFlyout])
 
   const stepFlyout = (delta: number) => {
     const flyout = flyoutRef.current
@@ -190,7 +236,7 @@ export default function DrawingRail({
   const onFlyoutKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (event.key === "Escape") {
       event.stopPropagation()
-      setOpenGroup(null)
+      closeFlyout(true)
       return
     }
     if (event.key === "ArrowDown") {
@@ -204,6 +250,9 @@ export default function DrawingRail({
     }
   }
 
+  // The analyst's count when the engine reports it, the total before it does.
+  const clearable = draw.aiCount ?? draw.count
+
   return (
     <div
       ref={railRef}
@@ -215,7 +264,7 @@ export default function DrawingRail({
         aria-label="Cursor, no drawing tool"
         title="Cursor (Escape)"
         onClick={() => {
-          setOpenGroup(null)
+          if (openGroup) closeFlyout(false)
           onPickTool(null)
         }}
         className={cn(RAIL_BUTTON, draw.activeTool === null && RAIL_ACTIVE)}
@@ -223,7 +272,10 @@ export default function DrawingRail({
         <MousePointer2 className="h-3.5 w-3.5 shrink-0" />
       </button>
 
-      <div className="scroll-thin flex min-h-0 flex-1 flex-col items-center gap-1 overflow-y-auto py-1">
+      <div
+        ref={scrollRef}
+        className="scroll-thin flex min-h-0 flex-1 flex-col items-center gap-1 overflow-y-auto py-1"
+      >
         {list.length === 0 ? (
           <button
             type="button"
@@ -245,6 +297,10 @@ export default function DrawingRail({
           return (
             <div key={group.group} className="relative">
               <button
+                ref={(element) => {
+                  if (element) triggerRefs.current.set(group.group, element)
+                  else triggerRefs.current.delete(group.group)
+                }}
                 type="button"
                 aria-haspopup="menu"
                 aria-expanded={open}
@@ -253,8 +309,7 @@ export default function DrawingRail({
                 disabled={group.tools.length === 0}
                 onClick={(event) => {
                   if (open) {
-                    setOpenGroup(null)
-                    setAnchor(null)
+                    closeFlyout(false)
                     return
                   }
                   const rect = event.currentTarget.getBoundingClientRect()
@@ -280,46 +335,52 @@ export default function DrawingRail({
                   style={{ position: "fixed", top: anchor.top, left: anchor.left }}
                   className="scroll-thin z-50 max-h-[60vh] w-56 overflow-y-auto rounded-xl border border-border bg-background p-1 shadow-l"
                 >
-                  <div className="px-2.5 py-1 text-[11px] uppercase tracking-wide text-muted-foreground">
-                    {group.group}
+                  {/* A menu's children must be items or groups; the visible
+                      header is decoration and the group label carries the text. */}
+                  <div role="group" aria-label={group.group}>
+                    <div
+                      aria-hidden="true"
+                      className="px-2.5 py-1 text-[11px] uppercase tracking-wide text-muted-foreground"
+                    >
+                      {group.group}
+                    </div>
+                    {group.tools.map((tool) => {
+                      const ToolIcon = drawToolIcon(tool.id)
+                      const active = tool.id === draw.activeTool
+                      return (
+                        <button
+                          key={tool.id}
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={active}
+                          data-flyout-item="true"
+                          onClick={() => {
+                            closeFlyout(true)
+                            onPickTool(tool.id)
+                          }}
+                          className={cn(
+                            "flex w-full items-center gap-2 rounded-lg px-2.5 py-1 text-left text-xs",
+                            active
+                              ? "bg-primary font-medium text-primary-foreground"
+                              : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                          )}
+                        >
+                          <ToolIcon className="h-3.5 w-3.5 shrink-0" />
+                          <span className="min-w-0 flex-1 truncate">{tool.name}</span>
+                          {tool.shortcut ? (
+                            <span
+                              className={cn(
+                                "shrink-0 font-mono text-[11px]",
+                                active ? "text-primary-foreground" : "text-muted-foreground"
+                              )}
+                            >
+                              {tool.shortcut}
+                            </span>
+                          ) : null}
+                        </button>
+                      )
+                    })}
                   </div>
-                  {group.tools.map((tool) => {
-                    const ToolIcon = drawToolIcon(tool.id)
-                    const active = tool.id === draw.activeTool
-                    return (
-                      <button
-                        key={tool.id}
-                        type="button"
-                        role="menuitemradio"
-                        aria-checked={active}
-                        data-flyout-item="true"
-                        onClick={() => {
-                          setOpenGroup(null)
-                          setAnchor(null)
-                          onPickTool(tool.id)
-                        }}
-                        className={cn(
-                          "flex w-full items-center gap-2 rounded-lg px-2.5 py-1 text-left text-xs",
-                          active
-                            ? "bg-primary font-medium text-primary-foreground"
-                            : "text-muted-foreground hover:bg-muted hover:text-foreground"
-                        )}
-                      >
-                        <ToolIcon className="h-3.5 w-3.5 shrink-0" />
-                        <span className="min-w-0 flex-1 truncate">{tool.name}</span>
-                        {tool.shortcut ? (
-                          <span
-                            className={cn(
-                              "shrink-0 font-mono text-[11px]",
-                              active ? "text-primary-foreground" : "text-muted-foreground"
-                            )}
-                          >
-                            {tool.shortcut}
-                          </span>
-                        ) : null}
-                      </button>
-                    )
-                  })}
                 </div>,
                 document.body
               ) : null}
@@ -361,10 +422,14 @@ export default function DrawingRail({
         </button>
         <button
           type="button"
-          disabled={draw.count === 0}
+          disabled={clearable === 0}
           onClick={onClearAll}
-          aria-label="Clear every drawing"
-          title={draw.count === 0 ? "No drawings to clear" : `Clear every drawing (${draw.count})`}
+          aria-label="Clear the analyst's drawings"
+          title={
+            clearable === 0
+              ? "No analyst drawings to clear"
+              : `Clear the analyst's drawings (${clearable})`
+          }
           className={cn(RAIL_BUTTON, "hover:text-danger")}
         >
           <Trash2 className="h-3.5 w-3.5 shrink-0" />

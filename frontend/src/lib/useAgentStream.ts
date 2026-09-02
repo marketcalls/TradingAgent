@@ -11,12 +11,17 @@
  *     than throwing. A new event type that is not handled here simply does
  *     nothing, which is quiet and hard to debug, so every case is explicit.
  *   - A "confirm" frame is terminal for its request. Nothing on the chart page
- *     is confirmation-gated, but if a gated tool ever reaches it the run would
- *     pause server-side and this hook would look hung. So the frame is surfaced
- *     as an error rather than ignored.
+ *     is confirmation-gated, but if a gated tool ever reaches it the run pauses
+ *     server-side waiting for an approval this surface cannot post. So the run
+ *     is cancelled on the spot rather than left orphaned, and the turn carries a
+ *     plain error instead of appearing to hang.
  *   - "chart_command" arrives mid-run, before any prose. It is handed straight
  *     to the caller and never stored on a message: the canvas is the state, not
- *     the transcript.
+ *     the transcript. The one thing kept is a flag that a draw landed, because
+ *     the follow-up chips need to know markup exists and no tool result says so.
+ *   - A "done" frame carries the reason the run ended. Anything but "stop" means
+ *     the answer never reached its conclusion, and the turn says so rather than
+ *     trailing off mid-sentence as if that were the whole reply.
  *   - The chart context is read at send time, not at mount. The user can change
  *     symbol or timeframe between turns and the analyst must see the chart as it
  *     is now.
@@ -44,6 +49,14 @@ export interface AgentStreamOptions {
   context?: () => unknown
   /** Reasoning effort, or "" for the server default. */
   effort?: string
+}
+
+/** True for a command that puts at least one shape on the canvas. A "draw" with
+ *  no shapes replaces its group with nothing, which is a clear by another name. */
+function drawsSomething(command: unknown): boolean {
+  if (!command || typeof command !== "object") return false
+  const candidate = command as { op?: unknown; shapes?: unknown }
+  return candidate.op === "draw" && Array.isArray(candidate.shapes) && candidate.shapes.length > 0
 }
 
 export function useAgentStream(options: AgentStreamOptions = {}): AgentStream {
@@ -111,22 +124,46 @@ export function useAgentStream(options: AgentStreamOptions = {}): AgentStream {
           break
         case "chart_command":
           // Straight to the canvas. Never stored on the message: a redraw on
-          // reload would replay stale geometry against different bars.
-          if (Array.isArray(event.commands)) optionsRef.current.onChartCommand?.(event.commands)
+          // reload would replay stale geometry against different bars. Only the
+          // fact that markup landed is kept, for the follow-up chips.
+          if (Array.isArray(event.commands)) {
+            optionsRef.current.onChartCommand?.(event.commands)
+            if (event.commands.some(drawsSomething)) {
+              patchLast((message) => (message.drew ? message : { ...message, drew: true }))
+            }
+          }
           break
         case "confirm":
           // Nothing on this surface is gated, so reaching here means a tool was
-          // registered that should not have been. The run is paused server-side
-          // and will never resume, so say so rather than appearing to hang.
+          // registered that should not have been. The server has closed the
+          // stream and parked the run until someone approves it, which nothing
+          // here can do. Cancel it so it is not left orphaned, and say why.
           adoptSession(event.session_id)
-          patchLast((message) => ({
-            ...message,
-            error:
-              "this action needs approval, which this page cannot give. Use the chat page instead."
-          }))
+          runIdRef.current = null
+          void cancelRun(event.run_id)
+          patchLast((message) => ({ ...message, error: "this page cannot approve actions" }))
           break
         case "done":
           adoptSession(event.session_id)
+          if (event.reason === "incomplete") {
+            patchLast((message) => ({
+              ...message,
+              cutShort: true,
+              notices: [
+                ...(message.notices ?? []),
+                { level: "warning", message: "The answer was cut short before it finished." }
+              ]
+            }))
+          } else if (event.reason === "cancelled") {
+            patchLast((message) => ({
+              ...message,
+              cutShort: true,
+              notices: [
+                ...(message.notices ?? []),
+                { level: "info", message: "The run was cancelled before the answer finished." }
+              ]
+            }))
+          }
           break
         case "error":
           patchLast((message) => ({ ...message, error: event.message || "the run failed" }))
@@ -146,6 +183,10 @@ export function useAgentStream(options: AgentStreamOptions = {}): AgentStream {
     async (text: string) => {
       const trimmed = text.trim()
       if (!trimmed || abortRef.current) return
+      // Cleared before the request goes out. Until this run's start frame lands
+      // the ref would still name the previous run, and a stop() in that window
+      // would cancel a run that has already finished.
+      runIdRef.current = null
       setMessages((previous) => [
         ...previous,
         { role: "user", content: trimmed },

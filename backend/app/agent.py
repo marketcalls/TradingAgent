@@ -267,8 +267,11 @@ def build_tool_factory(settings: Settings):
     def get_tools(run_context: RunContext) -> list:
         kits = _read_only_toolkits(lean=lean)
         state = getattr(run_context, "session_state", None) or {}
-        # The charts page sends its chart with every turn. Its absence is what
-        # tells us this is the chat page, where there is nothing to draw on.
+        # The charts page sends its chart with every turn, and the chat page sends
+        # chart=None rather than nothing: agno deep-merges the request's
+        # session_state over the stored copy, so an absent key would let a chart
+        # from an earlier turn in the same session persist and load these tools on
+        # a page that cannot show what they draw. A falsy chart means no chart.
         if state.get("chart"):
             chart = _chart_toolkit()
             if chart is not None:

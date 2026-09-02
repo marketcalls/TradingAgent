@@ -63,7 +63,25 @@ types resolved 100, a 69.0% hit rate: "bbands", "stoch rsi", "willr", "kst", "ke
 RetryAgentRun. match_indicator now runs six steps, exact first and fuzzy last, and the
 same corpus resolves 145 of 145. The fuzzy steps refuse to guess: where more than one
 indicator could be meant they hand the collision back so the caller asks, because a
-wrong indicator drawn confidently is worse than one honest question.
+wrong indicator drawn confidently is worse than one honest question. The reverse
+direction of the word-run step had one more way to guess: a generic word inside the
+phrase that happens to be a registry id. "volume weighted average price" resolved to
+plain Volume, "ema cross" to EMA, "median price" to the Median band, and bare
+"trend", "range" and "volatility" each landed on whichever indicator's name started
+with them. A run now resolves only when the indicator it names covers every
+significant word of the phrase, and a phrase made only of generic words (volume,
+trend, range, index, oscillator, band, average, price and the rest of _GENERIC)
+resolves through an exact id, an exact display name or the alias table, never
+through a fuzzy step.
+
+STATE ACROSS TOOLS. session_state["chart"] is written by the browser once per
+request, so a set_chart_symbol followed by draw_envelope in the same turn would draw
+the OLD instrument onto the new chart. The three chart-control tools now rewrite
+session_state["chart"] in place (new symbol, exchange or interval; time range and
+last price cleared so later tools fall back to the loaded range) and drop every
+stored pattern that no longer matches. Every reader of chart_patterns also checks
+the record's symbol, exchange and interval against the live context, and against
+the analyst groups the browser reports as still on screen, before trusting it.
 """
 
 from __future__ import annotations
@@ -80,11 +98,13 @@ from itertools import permutations
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from agno.exceptions import RetryAgentRun
 from agno.run.agent import CustomEvent
 from agno.run.base import RunContext
 from agno.tools import Toolkit
 
+from ..charts.colours import colour_to_hex
 from ..charts.contract import (
     Anchor,
     ChartContext,
@@ -142,6 +162,39 @@ SNAP_TOLERANCE_PCT = 2.0
 # percentage of the line's price there. The geometry default, named here because
 # both rails of a channel must be fitted on the same terms.
 TREND_TOLERANCE_PCT = 0.5
+
+# How far a closed bar may poke beyond a rail before it counts as crossing it.
+# Tighter than the touch slack: at 0.5 a bar 7 points through a rail on a 1400
+# stock still read as contained. Mirrors geometry.CROSSING_TOLERANCE_PCT.
+CROSSING_TOLERANCE_PCT = 0.2
+
+# The fractal window used both to snap a named price and to fit the line through
+# the pivots between the snapped ends. One window for both, so a pivot the snap
+# found is a pivot the fit can see.
+TRENDLINE_LEFT = 2
+TRENDLINE_RIGHT = 2
+
+# What a later tool is told when a stored pattern no longer belongs to the chart.
+STALE_PATTERN = ("was drawn on {then}, and the chart now shows {now}, so its geometry "
+                 "does not apply. Call draw_envelope again on this chart first.")
+
+# Words that carry no indicator meaning in a spoken phrase. Dropped before deciding
+# whether a matched id or name covers the whole phrase, so "the rsi" and "add rsi
+# line" both resolve while "ema cross" does not.
+_STOPWORDS = frozenset({
+    "the", "a", "an", "add", "show", "me", "on", "chart", "indicator", "line", "lines",
+    "please", "my", "to", "this",
+})
+
+# Words that are too generic to resolve through any fuzzy step. Each is a registry id
+# or a substring of several display names, so prefix, run and containment matching
+# would all turn it into a confident guess. A phrase made only of these resolves by
+# exact id, exact display name or the alias table, or not at all.
+_GENERIC = frozenset({
+    "volume", "volatility", "trend", "range", "median", "momentum", "index",
+    "oscillator", "channel", "bands", "band", "average", "price", "moving", "cross",
+    "profile", "stop", "regression", "linear",
+})
 
 NO_CHART = (
     "No chart is open, so there is nothing to read or draw on. Tell the user to open a "
@@ -221,13 +274,21 @@ _ID_ALIASES = {
     "kvo": "klinger-oscillator",
     # Volatility and trend.
     "averagetruerange": "atr",
+    # The catalogue has no bare True Range indicator (checked: "true" appears only in
+    # ATR and True Strength Index), so the spoken form lands on ATR.
+    "truerange": "atr",
     "dmi": "adx",
+    "averagedirectionalindex": "adx",
     "wvf": "williams-vix-fix",
     "cks": "chande-kroll-stop",
     "hv": "historical-volatility",
     "adr": "average-daily-range",
     "stdev": "standard-deviation",
     "stddev": "standard-deviation",
+    "envelopes": "envelope",
+    # Spelled-out forms whose words are all generic, so no fuzzy step may touch them.
+    "volumeweightedaverageprice": "vwap",
+    "movingaverageconvergencedivergence": "macd",
 }
 
 
@@ -351,6 +412,28 @@ def _prefix_head(candidates: list[str]) -> str | None:
     return None
 
 
+def _significant(words: list[str]) -> list[str]:
+    """The words of a phrase that carry meaning: everything but the stopwords."""
+    return [w for w in words if w not in _STOPWORDS]
+
+
+def _covers(indicator_id: str, words: list[str]) -> bool:
+    """True when this indicator's id or display name accounts for every word.
+
+    A word is covered when it, or its singular (a trailing "s" dropped), sits inside
+    the normalised id or the normalised display name. So "donchian channels" is
+    covered by Donchian Channel, and "volume weighted average price" is not covered
+    by Volume, because "weighted" appears in neither its id nor its name.
+    """
+    catalogue = load_catalogue().get("indicators", {})
+    haystack = _norm(indicator_id) + " " + _norm(catalogue.get(indicator_id, {}).get("name", ""))
+    for word in words:
+        stem = word[:-1] if len(word) > 3 and word.endswith("s") else word
+        if _norm(stem) not in haystack:
+            return False
+    return True
+
+
 def _match_name(text: str) -> tuple[str | None, list[str]]:
     """Match a name with no numbers in it against the catalogue.
 
@@ -365,8 +448,18 @@ def _match_name(text: str) -> tuple[str | None, list[str]]:
          words that IS an id or display name ("donchian channel", "the rsi"). The
          reverse direction is anchored on word boundaries on purpose: without that,
          "smart money concepts" starts with "sma" and would draw a moving average.
+         It also resolves only when the indicator the run names covers every
+         significant word of the phrase (stopwords dropped): "volume weighted average
+         price" contains the id "volume", but Volume says nothing about "weighted",
+         so the run does not resolve and the alias table answers vwap instead.
       f. containment, the last resort: the typed text sits inside exactly one id or
          display name ("vix fix", "force index", "cloud").
+
+    A phrase whose significant words are all generic (_GENERIC) stops after step d.
+    "trend", "range", "volatility", "linear regression" and "median price" are each
+    the start or the inside of several indicator names, and any fuzzy answer to them
+    is a guess. They come back as None with the indicators that contain them as
+    candidates, so the caller can ask.
 
     Steps e and f resolve only when the answer is unique, or when _prefix_head finds
     the one indicator the other matches are variants of. Any other collision returns
@@ -401,6 +494,15 @@ def _match_name(text: str) -> tuple[str | None, list[str]]:
     if tight in _ID_ALIASES and _ID_ALIASES[tight] in catalogue:
         return _ID_ALIASES[tight], []
 
+    words = _words(lowered)
+    meaningful = _significant(words) or words
+    if all(w in _GENERIC for w in meaningful):
+        # Too generic for any fuzzy step. Name what contains it and stop.
+        stems = [_norm(w) for w in meaningful]
+        inside = sorted({i for k, i in ids.items() if any(s in k for s in stems)}
+                        | {i for k, i in names.items() if any(s in k for s in stems)})
+        return None, inside
+
     forward = sorted({i for k, i in ids.items() if k.startswith(tight)}
                      | {i for k, i in names.items() if k.startswith(tight)})
     if forward:
@@ -413,20 +515,22 @@ def _match_name(text: str) -> tuple[str | None, list[str]]:
         head = _prefix_head(forward)
         return (head, []) if head else (None, forward)
 
-    words = _words(lowered)
     runs = {_norm("".join(words[i:j]))
             for i in range(len(words)) for j in range(i + 1, len(words) + 1)}
     spoken = sorted({ids[r] for r in runs if r in ids}
                     | {names[r] for r in runs if r in names})
-    if spoken:
-        return (spoken[0], []) if len(spoken) == 1 else (None, spoken)
+    covering = [i for i in spoken if _covers(i, meaningful)]
+    if covering:
+        return (covering[0], []) if len(covering) == 1 else (None, covering)
 
     if len(tight) >= MIN_FUZZY_CHARS:
         inside = sorted({i for k, i in ids.items() if tight in k}
                         | {i for k, i in names.items() if tight in k})
         if inside:
             return (inside[0], []) if len(inside) == 1 else (None, inside)
-    return None, []
+    # A run that named an indicator without covering the phrase is still the best
+    # hint there is: hand it back as a candidate rather than as an answer.
+    return None, spoken
 
 
 @dataclass(frozen=True)
@@ -508,6 +612,33 @@ def suggest_indicator_ids(raw: str, limit: int = 6) -> list[str]:
     return out[:limit]
 
 
+#: The words a user says for shading, mapped onto whatever the indicator calls it.
+_FILL_ALIASES = frozenset({"fill", "shade", "shading", "fillcolour", "fill_colour"})
+
+
+def _fill_key(entry: dict[str, Any]) -> str | None:
+    """The input key that colours an indicator's shading.
+
+    Prefers the declared fill colour, then a band colour, since an indicator
+    without a dedicated fill still shades through the band it draws.
+
+    Args:
+        entry: One catalogue indicator.
+
+    Returns:
+        The input key, or None when the indicator has nothing to shade.
+    """
+    fill = entry.get("fill") or {}
+    key = fill.get("color_key")
+    keys = {i["key"] for i in entry.get("inputs", [])}
+    if key and key in keys:
+        return str(key)
+    for candidate in ("fillColor", "bandColor", "color"):
+        if candidate in keys:
+            return candidate
+    return None
+
+
 def _numeric_inputs(entry: dict) -> list[dict]:
     return [i for i in entry.get("inputs", []) if i.get("type") == "number"]
 
@@ -561,7 +692,15 @@ def _in_bounds(spec: dict, value: float) -> bool:
     return True
 
 
-def assign_positional(entry: dict, values: list[float]) -> tuple[dict[str, float], str]:
+#: Cost of leaving a numeric setting empty ahead of one that was filled, in the same
+#: units as the relative distance to a default. It is what makes "rsi 21" a length
+#: rather than an oversold band (0.5 away from the default length against 0.3 from
+#: the default band, but the band sits two slots in) while "rsi 30 70" still lands
+#: on the bands, because two exact default hits cost nothing.
+_SKIPPED_SLOT_COST = 0.25
+
+
+def assign_positional(entry: dict, values: list[float]) -> tuple[dict[str, float], str, list[float]]:
     """Land bare numbers, as spoken, on named indicator settings.
 
     "supertrend 3,10" is genuinely ambiguous: the declared bounds are ATR Period 1..200
@@ -572,39 +711,54 @@ def assign_positional(entry: dict, values: list[float]) -> tuple[dict[str, float
     "macd 12,26,9" and "bollinger 20,2" both come out in declaration order because that
     is already the nearest-to-defaults assignment.
 
+    Every numeric setting is a candidate slot, not just the first N. "rsi 30 70" is
+    the oversold and overbought bands (RSI declares length, overbought, oversold, and
+    30 and 70 are those bands' exact defaults), not a length of 30. A slot left empty
+    ahead of a filled one costs :data:`_SKIPPED_SLOT_COST`, so a single number still
+    lands on the length. When there are more numbers than settings, the first ones
+    spoken are placed and the rest are handed back so the reply can say so.
+
     Args:
         entry: One catalogue entry.
         values: The bare numbers, in the order the user said them.
 
     Returns:
-        A (settings, reading) pair. `reading` is a plain sentence naming the assignment
-        so the user can correct it in four words.
+        A (settings, reading, unplaced) triple. `reading` is a plain sentence naming
+        the assignment so the user can correct it in four words; `unplaced` holds the
+        numbers that had no setting to go to.
     """
-    slots = _numeric_inputs(entry)[: len(values)]
+    slots = _numeric_inputs(entry)
     if not slots or not values:
-        return {}, ""
+        return {}, "", list(values or [])
 
-    best: tuple[float, tuple[float, ...]] | None = None
-    for candidate in permutations(values, len(slots)):
-        if not all(_in_bounds(spec, v) for spec, v in zip(slots, candidate)):
+    placed = list(values[: len(slots)])
+    unplaced = list(values[len(slots):])
+
+    best: tuple[float, tuple[tuple[int, float], ...]] | None = None
+    for chosen in permutations(range(len(slots)), len(placed)):
+        pairs = tuple(zip(chosen, placed))
+        if not all(_in_bounds(slots[i], v) for i, v in pairs):
             continue
         score = 0.0
-        for spec, value in zip(slots, candidate):
-            default = float(spec.get("default", 0) or 0)
+        for i, value in pairs:
+            default = float(slots[i].get("default", 0) or 0)
             score += abs(value - default) / max(abs(default), 1.0)
-        if best is None or score < best[0] - 1e-12:
-            best = (score, candidate)
+        last = max(chosen)
+        skipped = sum(1 for i in range(last + 1) if i not in chosen)
+        score += _SKIPPED_SLOT_COST * skipped
+        key = (score, tuple(sorted(pairs)))
+        if best is None or key[0] < best[0] - 1e-12:
+            best = (score, tuple(sorted(pairs)))
 
     if best is None:
         # Nothing fits the declared ranges. Fall back to declaration order and let the
         # bounds check downstream report which number is out of range.
-        best = (0.0, tuple(values[: len(slots)]))
+        best = (0.0, tuple(enumerate(placed)))
 
-    settings = {spec["key"]: _tidy(value) for spec, value in zip(slots, best[1])}
-    reading = ", ".join(
-        f"{spec['label']} {_tidy(value)}" for spec, value in zip(slots, best[1])
-    )
-    return settings, reading
+    assignment = sorted(best[1])
+    settings = {slots[i]["key"]: _tidy(value) for i, value in assignment}
+    reading = ", ".join(f"{slots[i]['label']} {_tidy(value)}" for i, value in assignment)
+    return settings, reading, unplaced
 
 
 def _tidy(value: float) -> Any:
@@ -675,6 +829,101 @@ def _patterns(run_context: RunContext | None) -> dict[str, Any]:
     return store
 
 
+def _retarget(run_context: RunContext | None, keep_range: bool = False,
+              **changes: Any) -> ChartContext | None:
+    """Rewrite session_state["chart"] in place after a chart-control tool ran.
+
+    The browser writes the chart context once per request, so without this a
+    set_chart_symbol followed by draw_envelope in the same turn would fetch and draw
+    the previous instrument. The loaded range, the viewport and the last price are
+    cleared on an instrument or interval change, because they describe bars the
+    chart no longer shows; a later tool then falls back to the whole fetched frame.
+
+    Args:
+        run_context: The run context agno injected.
+        keep_range: Leave the time range and last price alone. True for a chart
+            type change, which redraws the same bars.
+        **changes: Field values to set, by field name (symbol, exchange, interval,
+            chart_type).
+
+    Returns:
+        The rewritten context, or None when there is no session state to write.
+    """
+    state = getattr(run_context, "session_state", None)
+    if state is None:
+        return None
+    raw = state.get(STATE_CHART)
+    base = ChartContext()
+    if isinstance(raw, ChartContext):
+        base = raw
+    elif isinstance(raw, dict):
+        try:
+            base = ChartContext.model_validate(raw)
+        except Exception:  # noqa: BLE001
+            base = ChartContext()
+    update = dict(changes)
+    if not keep_range:
+        update.update(first_time=None, last_time=None, visible_from=None,
+                      visible_to=None, last_price=None)
+    fresh = base.model_copy(update=update)
+    state[STATE_CHART] = fresh.model_dump(by_alias=True)
+    return fresh
+
+
+def _instrument(symbol: Any, exchange: Any, interval: Any) -> str:
+    """One short label for a (symbol, exchange, interval) triple."""
+    return " ".join(str(part) for part in (symbol, exchange, interval) if part)
+
+
+def _matches_context(record: dict, ctx: ChartContext) -> bool:
+    """True when a stored pattern was drawn on the instrument and interval shown now."""
+    if not isinstance(record, dict):
+        return False
+    return (
+        str(record.get("symbol") or "").upper() == str(ctx.symbol or "").upper()
+        and str(record.get("exchange") or "").upper() == str(ctx.exchange or "").upper()
+        and str(record.get("interval") or "").lower() == str(ctx.interval or "").lower()
+    )
+
+
+def _on_chart(record: dict, ctx: ChartContext) -> bool:
+    """True unless the browser reported the analyst groups on screen and this one is
+    not among them. The user can clear the analyst's markup from the toolbar without
+    any tool hearing about it, so the browser's list outranks the backend's store."""
+    if ctx.analyst_groups is None:
+        return True
+    return str(record.get("group") or "") in {str(g) for g in ctx.analyst_groups}
+
+
+def _visible_patterns(run_context: RunContext | None, ctx: ChartContext) -> dict[str, Any]:
+    """The stored patterns that belong to this chart and are still on it."""
+    return {
+        key: record for key, record in _patterns(run_context).items()
+        if _matches_context(record, ctx) and _on_chart(record, ctx)
+    }
+
+
+def _prune_patterns(run_context: RunContext | None, ctx: ChartContext) -> list[str]:
+    """Drop every stored pattern whose instrument or interval no longer matches.
+
+    Returns:
+        The group names that were dropped, for the reply.
+    """
+    store = _patterns(run_context)
+    dropped = sorted(key for key, record in store.items()
+                     if not _matches_context(record, ctx))
+    for key in dropped:
+        store.pop(key, None)
+    return dropped
+
+
+def _stale_sentence(group: str, record: dict, ctx: ChartContext) -> str:
+    """Why a stored pattern cannot be used on the chart shown now."""
+    then = _instrument(record.get("symbol"), record.get("exchange"), record.get("interval"))
+    now = _instrument(ctx.symbol, ctx.exchange, ctx.interval)
+    return f"The {group} " + STALE_PATTERN.format(then=then, now=now)
+
+
 # --- geometry plumbing ------------------------------------------------------
 
 
@@ -711,9 +960,47 @@ def _round(value: Any, places: int = 2) -> Any:
     return None if out is None else round(out, places)
 
 
-def _store_envelope(run_context: RunContext | None, group: str, ctx: ChartContext,
-                    env: dict) -> dict[str, Any]:
-    """Persist an envelope so a later turn can still project targets off it."""
+def _rail_dict(rail: Any) -> dict[str, Any] | None:
+    """The JSON-safe form of one fit_channel rail: exactly the line that was drawn."""
+    if not isinstance(rail, dict):
+        return None
+    try:
+        return {
+            "from": {"time": float(rail["from"]["time"]), "price": float(rail["from"]["price"])},
+            "to": {"time": float(rail["to"]["time"]), "price": float(rail["to"]["price"])},
+            "slope": _finite(rail.get("slope")),
+            "intercept": _finite(rail.get("intercept")),
+            "touches": int(rail.get("touches") or 0),
+            "crossings": int(rail.get("crossings") or 0),
+            "from_pivot": _pivot_dict(rail.get("from_pivot")),
+            "to_pivot": _pivot_dict(rail.get("to_pivot")),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _store_channel(run_context: RunContext | None, group: str, ctx: ChartContext,
+                   env: dict, fit: dict) -> dict[str, Any]:
+    """Persist a channel so a later turn can still project targets off it.
+
+    The record carries the fitted rails themselves, not just the pivots: a measured
+    move has to be taken off the line on screen, and refitting the pivots later put
+    the two a median 11 points apart on synthetic frames.
+
+    Args:
+        run_context: The run context agno injected.
+        group: The drawing group the channel was emitted on.
+        ctx: The chart it was drawn on, so a later reader can refuse a mismatch.
+        env: The geometry.envelope result the rails were fitted from.
+        fit: The geometry.fit_channel result.
+
+    Returns:
+        The stored record.
+    """
+    upper = _rail_dict(fit.get("upper"))
+    lower = _rail_dict(fit.get("lower"))
+    starts = [r["from"]["time"] for r in (upper, lower) if r is not None]
+    ends = [r["to"]["time"] for r in (upper, lower) if r is not None]
     record = {
         "kind": "envelope",
         "group": group,
@@ -722,29 +1009,96 @@ def _store_envelope(run_context: RunContext | None, group: str, ctx: ChartContex
         "interval": ctx.interval,
         "highs": [_pivot_dict(p) for p in env.get("highs", [])],
         "lows": [_pivot_dict(p) for p in env.get("lows", [])],
-        "slope_high": _finite(env.get("slope_high")),
-        "slope_low": _finite(env.get("slope_low")),
         "direction": env.get("direction"),
-        "width": _finite(env.get("width")),
-        "first_time": _finite(env.get("first_time")),
-        "last_time": _finite(env.get("last_time")),
+        "shape": fit.get("shape"),
+        "width": _finite(fit.get("width_right")),
+        "upper": upper,
+        "lower": lower,
+        "first_time": min(starts) if starts else _finite(env.get("first_time")),
+        "last_time": max(ends) if ends else _finite(env.get("last_time")),
     }
     _patterns(run_context)[group] = record
     return record
 
 
-def _restore_envelope(record: dict) -> dict[str, Any]:
+def _restore_channel(record: dict) -> dict[str, Any]:
     """Turn a stored record back into the dict shape geometry.measured_move expects."""
     return {
-        "highs": [_to_pivot(p) for p in record.get("highs", [])],
-        "lows": [_to_pivot(p) for p in record.get("lows", [])],
-        "slope_high": record.get("slope_high"),
-        "slope_low": record.get("slope_low"),
+        "upper": record.get("upper"),
+        "lower": record.get("lower"),
+        "shape": record.get("shape"),
         "direction": record.get("direction"),
-        "width": record.get("width"),
-        "first_time": record.get("first_time"),
-        "last_time": record.get("last_time"),
+        "width_right": record.get("width"),
     }
+
+
+def _visible_extent(df: Any, start: float | None, end: float | None) -> tuple[int, float, float]:
+    """Bar count, lowest low and highest high inside the window, for an error message."""
+    try:
+        times = G.to_utc_seconds(df.index)
+        mask = np.isfinite(times)
+        if start is not None:
+            mask &= times >= float(start)
+        if end is not None:
+            mask &= times <= float(end)
+        if not mask.any():
+            mask = np.isfinite(times)
+        lows = df["low"].to_numpy(dtype=float)[mask]
+        highs = df["high"].to_numpy(dtype=float)[mask]
+        return int(mask.sum()), float(np.nanmin(lows)), float(np.nanmax(highs))
+    except Exception:  # noqa: BLE001
+        return int(len(df)), float(df["low"].min()), float(df["high"].max())
+
+
+async def _snap_pair(df: Any, from_price: Any, to_price: Any, start: float | None,
+                     end: float | None, left: int, right: int) -> tuple[Any, Any]:
+    """Snap a "from A to B" pair of prices onto pivots inside the window.
+
+    "From A to B" is a time order as well as a pair of prices, so B is looked for
+    after A first and only then anywhere in the window. Without that, "from 1493 to
+    1309" on a range snapped B onto an earlier low at the same price, the window
+    flipped, and the line ran up into the named high instead of down from it.
+
+    Args:
+        df: The candle frame.
+        from_price: The first price, or 0 / None when the user named none.
+        to_price: The second price, likewise.
+        start: Lower bound of the snap pool in UTC seconds.
+        end: Upper bound of the snap pool.
+        left: Fractal bars to the left.
+        right: Fractal bars to the right.
+
+    Returns:
+        A (start_pivot, end_pivot) pair, each a geometry.Pivot or None.
+    """
+    start_pivot = None
+    end_pivot = None
+    if _finite(from_price):
+        start_pivot = await asyncio.to_thread(
+            G.snap_to_pivot, df, float(from_price), "any", SNAP_TOLERANCE_PCT,
+            start, end, left, right)
+    if _finite(to_price):
+        after = start_pivot.time if start_pivot is not None else start
+        end_pivot = await asyncio.to_thread(
+            G.snap_to_pivot, df, float(to_price), "any", SNAP_TOLERANCE_PCT,
+            after, end, left, right)
+        if end_pivot is None and start_pivot is not None:
+            end_pivot = await asyncio.to_thread(
+                G.snap_to_pivot, df, float(to_price), "any", SNAP_TOLERANCE_PCT,
+                start, end, left, right)
+    return start_pivot, end_pivot
+
+
+def _missing_price_message(missing: list[str], df: Any, ctx: ChartContext,
+                           start: float | None, end: float | None) -> str:
+    """The RetryAgentRun text for a named price that snapped onto nothing."""
+    count, low, high = _visible_extent(df, start, end)
+    return (
+        f"No swing pivot within {SNAP_TOLERANCE_PCT}% of the {', '.join(missing)} you "
+        f"gave. The visible {count} bars of {ctx.symbol} {ctx.interval} ranged "
+        f"{low:.2f} to {high:.2f}. Give a price inside that range, zoom out to include "
+        "more bars, or omit the prices and let the detector choose."
+    )
 
 
 def _rail_sentence(name: str, rail: dict[str, Any], what: str) -> str:
@@ -778,26 +1132,34 @@ def _tone_for(direction: Any) -> str:
     return "neutral"
 
 
-def _extract_targets(measured: dict) -> list[tuple[str, float]]:
-    """Name the two measured-move targets, skipping the ones that are not prices.
+def _extract_targets(measured: dict) -> tuple[list[tuple[str, float]], list[str]]:
+    """Name the two measured-move targets, and the ones that are not prices.
 
     geometry.measured_move returns width, direction, time, target_time, breakout,
     breakdown, upside_target and downside_target. Only the last four are prices;
     target_time in particular is UTC seconds and would draw a level at year 59,000 if
     it were treated as one.
+
+    Returns:
+        A (targets, dropped) pair: the drawable (name, price) targets, and the names
+        of any target that fell to zero or below and so cannot be a price. A dropped
+        target is reported in the reply, never lost in silence.
     """
     if not isinstance(measured, dict):
-        return []
+        return [], []
     width = _finite(measured.get("width")) or 0.0
     if width <= 0:
-        return []
+        return [], []
     out: list[tuple[str, float]] = []
+    dropped: list[str] = []
     for key, name in (("upside_target", "upside target"),
                       ("downside_target", "downside target")):
         price = _finite(measured.get(key))
         if price is not None and price > 0:
             out.append((name, price))
-    return out
+        else:
+            dropped.append(name)
+    return out, dropped
 
 
 class ChartTools(Toolkit):
@@ -911,9 +1273,18 @@ class ChartTools(Toolkit):
             ex = C.INDEX_EXCHANGE[sym]
             note += f" ({sym} quotes on {ex})"
 
+        # The browser only writes the chart context at the start of a request, so
+        # a draw later in this same turn would otherwise read the previous symbol.
+        fresh = _retarget(run_context, symbol=sym, exchange=ex)
+        dropped = _prune_patterns(run_context, fresh) if fresh is not None else []
+
         yield ChartCommandEvent(commands=[{"op": "set_symbol", "symbol": sym,
                                           "exchange": ex}])
-        yield f"Chart switched to {sym} on {ex}.{note}"
+        text = f"Chart switched to {sym} on {ex}.{note}"
+        if dropped:
+            text += (f" The {', '.join(dropped)} markup belonged to the previous chart "
+                     "and was dropped; draw again if it is wanted here.")
+        yield text
 
     async def set_chart_interval(self, interval: str,
                                  run_context: RunContext | None = None):
@@ -945,8 +1316,15 @@ class ChartTools(Toolkit):
                 f"{', '.join(supported) or 'nothing reported'}. Pick one of those."
             )
 
+        fresh = _retarget(run_context, interval=match)
+        dropped = _prune_patterns(run_context, fresh) if fresh is not None else []
+
         yield ChartCommandEvent(commands=[{"op": "set_interval", "interval": match}])
-        yield f"Chart interval set to {match}."
+        text = f"Chart interval set to {match}."
+        if dropped:
+            text += (f" The {', '.join(dropped)} markup was drawn on the previous "
+                     "interval and was dropped; draw again if it is wanted here.")
+        yield text
 
     async def set_chart_type(self, chart_type: str,
                              run_context: RunContext | None = None):
@@ -973,6 +1351,9 @@ class ChartTools(Toolkit):
             raise RetryAgentRun(
                 f"Unknown chart type {chart_type!r}. Available types: {', '.join(known)}."
             )
+
+        # Same bars, same range: only the rendering changed.
+        _retarget(run_context, keep_range=True, chart_type=wanted)
 
         yield ChartCommandEvent(commands=[{"op": "set_chart_type", "chartType": wanted}])
         yield f"Chart type set to {wanted}."
@@ -1119,12 +1500,27 @@ class ChartTools(Toolkit):
         # was spoken as part of the name. Explicit values win: they are the more
         # deliberate of the two.
         positional = _coerce_values(settings) or list(match.values)
+        unplaced: list[float] = []
         if positional:
-            applied, reading = assign_positional(entry, positional)
+            applied, reading, unplaced = assign_positional(entry, positional)
+
+        # "fill the bands yellow" is what a user says; fillColor is what the chart
+        # calls it, and an indicator without one shades through its band colour.
+        # Aliasing here means the model does not have to know which is which.
+        fill_key = _fill_key(entry)
+        opacity_hint: float | None = None
 
         for key, value in (settings or {}).items():
             if key == "values":
                 continue
+            if key in _FILL_ALIASES:
+                if fill_key is None:
+                    raise RetryAgentRun(
+                        f"{entry['name']} has no shading to colour. Its settings are: "
+                        + ", ".join(f"{i['key']} ({i['label']})" for i in entry.get("inputs", []))
+                        + "."
+                    )
+                key = fill_key
             spec = by_key.get(key)
             if spec is None:
                 raise RetryAgentRun(
@@ -1144,12 +1540,27 @@ class ChartTools(Toolkit):
                         f"{spec.get('min')} and {spec.get('max')}, got {number}."
                     )
                 applied[key] = _tidy(number)
+            elif spec.get("type") == "color":
+                try:
+                    hex_value, hint = colour_to_hex(str(value))
+                except ValueError as exc:
+                    raise RetryAgentRun(str(exc)) from None
+                applied[key] = hex_value
+                if hint is not None and key == fill_key:
+                    opacity_hint = hint
             else:
                 applied[key] = value
 
         described = ", ".join(
             f"{by_key.get(k, {}).get('label', k)} {v}" for k, v in applied.items()
         ) or "its defaults"
+
+        # The "light" in "light yellow" is carried by the hue, not by opacity. A
+        # plot's opacity input runs 0 to 100 and defaults to 100, while the fill's
+        # own opacity is a 0-to-1 fraction the descriptor fixes and the user cannot
+        # set. Pushing the 0.15 hint into a plot opacity made the band lines
+        # invisible, which is the opposite of what was asked for.
+        _ = opacity_hint
 
         yield ChartCommandEvent(commands=[{
             "op": "add_indicator", "indicatorId": resolved,
@@ -1165,6 +1576,18 @@ class ChartTools(Toolkit):
             sentence += (
                 f" Read {spoken} as {reading}; say which setting you meant if that is "
                 "the wrong way round."
+            )
+        if unplaced:
+            # A number with nowhere to go is not dropped in silence: "ema 200 50" is
+            # most likely two EMAs, and the user has to hear that only one was added.
+            numeric = _numeric_inputs(entry)
+            labels = ", ".join(i["label"] for i in numeric) or "none"
+            spare = ", ".join(str(_tidy(v)) for v in unplaced)
+            sentence += (
+                f" {spare} was not placed: {entry['name']} has "
+                f"{len(numeric)} numeric setting{'s' if len(numeric) != 1 else ''} "
+                f"({labels}). Tell the user, and call add_chart_indicator again if they "
+                "wanted a second instance."
             )
         yield sentence
 
@@ -1268,31 +1691,21 @@ class ChartTools(Toolkit):
             return
         df = res["frame"]
 
-        start_pivot = None
-        end_pivot = None
-        if _finite(from_price):
-            start_pivot = await asyncio.to_thread(
-                G.snap_to_pivot, df, float(from_price), "any", SNAP_TOLERANCE_PCT)
-        if _finite(to_price):
-            end_pivot = await asyncio.to_thread(
-                G.snap_to_pivot, df, float(to_price), "any", SNAP_TOLERANCE_PCT)
+        # The snap pool is the viewport, not the fetched frame, so the same number
+        # snaps to the same bar whatever lookback the model happened to pass.
+        ctx_start, ctx_end = self._window(ctx)
+        start_pivot, end_pivot = await _snap_pair(
+            df, from_price, to_price, ctx_start, ctx_end, G.SNAP_LEFT, G.SNAP_RIGHT)
 
         missing = [name for name, price, hit in
                    (("from_price", from_price, start_pivot), ("to_price", to_price, end_pivot))
                    if _finite(price) and hit is None]
         if missing:
-            low, high = float(df["low"].min()), float(df["high"].max())
-            raise RetryAgentRun(
-                f"No swing pivot within {SNAP_TOLERANCE_PCT}% of the {', '.join(missing)} "
-                f"you gave. Over the last {len(df)} bars {ctx.symbol} ranged {low:.2f} "
-                f"to {high:.2f}. Give a price inside that range, or omit it and let the "
-                "detector choose."
-            )
+            raise RetryAgentRun(_missing_price_message(missing, df, ctx, ctx_start, ctx_end))
 
         # A price the user named pins that end of the window; an end they did not name
         # falls back to the viewport, because "draw the swing" means the swing they can
         # see, not every bar the fetch happened to return.
-        ctx_start, ctx_end = self._window(ctx)
         window_start = start_pivot.time if start_pivot is not None else ctx_start
         window_end = end_pivot.time if end_pivot is not None else ctx_end
         if window_start is not None and window_end is not None and window_start > window_end:
@@ -1306,22 +1719,25 @@ class ChartTools(Toolkit):
         highs = list(env.get("highs") or [])
         lows = list(env.get("lows") or [])
         if len(highs) < 2 and len(lows) < 2:
-            yield (f"Not enough swing structure in the last {len(df)} bars of "
+            yield (f"Not enough swing structure in the visible bars of "
                    f"{ctx.symbol} {ctx.interval} to fit a channel: it needs at least "
-                   "two swing highs or two swing lows. Try a longer lookback.")
+                   "two swing highs or two swing lows. Zoom out to include more bars, "
+                   "or omit the prices and let the detector choose.")
             return
 
         # Two straight lines, each fitted to its own side and each starting at
-        # its own first anchor. fit_channel picks the pair of pivots whose line
-        # is crossed by the fewest bars over its span, so a rail actually bounds
-        # price, and it is deterministic, so the same chart draws the same lines.
+        # its own first anchor. fit_channel prefers a pair of pivots whose line
+        # no closed bar crosses over its span, so a rail actually bounds price,
+        # and it is deterministic, so the same chart draws the same lines.
         fit = await asyncio.to_thread(
-            G.fit_channel, df, highs, lows, window_start, window_end, TREND_TOLERANCE_PCT)
+            G.fit_channel, df, highs, lows, window_start, window_end,
+            TREND_TOLERANCE_PCT, CROSSING_TOLERANCE_PCT)
         upper = fit.get("upper")
         lower = fit.get("lower")
         if upper is None and lower is None:
             yield (f"Could not fit a channel through the swings on {ctx.symbol} "
-                   f"{ctx.interval}. Try a longer lookback.")
+                   f"{ctx.interval}. Zoom out to include more bars, or omit the prices "
+                   "and let the detector choose.")
             return
 
         tone = _tone_for(env.get("direction"))
@@ -1336,18 +1752,30 @@ class ChartTools(Toolkit):
                 from_=Anchor(**lower["from"]), to=Anchor(**lower["to"]),
                 extend_right=True, tone=tone))
 
+        shape_name = str(fit.get("shape") or "sideways")
+        crossed = shape_name == "crossed"
         width = float(fit.get("width_right") or 0.0)
-        record = _store_envelope(run_context, GROUP_ENVELOPE, ctx, env)
-        record["width"] = width
-        record["shape"] = fit.get("shape")
+        record = _store_channel(run_context, GROUP_ENVELOPE, ctx, env, fit)
+        if crossed:
+            # Real structure, still drawn, but not a channel: project_targets must
+            # not measure a height off rails that have already met.
+            record["kind"] = "crossed"
         yield ChartCommandEvent(commands=[draw_command(GROUP_ENVELOPE, shapes)])
 
-        parts = [f"Drew a {fit.get('shape', 'sideways')} channel on {ctx.symbol} {ctx.interval}."]
+        if crossed:
+            parts = [f"Drew two rails on {ctx.symbol} {ctx.interval}. The two rails "
+                     "cross inside the window, so this is a pattern that has already "
+                     "resolved, not a channel."]
+        elif upper is None or lower is None:
+            parts = [f"Drew one trendline on {ctx.symbol} {ctx.interval}; the other "
+                     "side has too few swings for a rail."]
+        else:
+            parts = [f"Drew a {shape_name} channel on {ctx.symbol} {ctx.interval}."]
         if upper is not None:
             parts.append(_rail_sentence("Upper rail", upper, "swing highs"))
         if lower is not None:
             parts.append(_rail_sentence("Lower rail", lower, "swing lows"))
-        if upper is not None and lower is not None:
+        if upper is not None and lower is not None and not crossed:
             parts.append(f"Width at the right edge {_round(width)}.")
         yield " ".join(parts)
 
@@ -1394,34 +1822,47 @@ class ChartTools(Toolkit):
                       and end_price < start_price)
         kind = "high" if descending else "low"
 
-        start_pivot = None
-        end_pivot = None
-        if start_price:
-            start_pivot = await asyncio.to_thread(
-                G.snap_to_pivot, df, start_price, kind, SNAP_TOLERANCE_PCT)
-        if end_price:
-            end_pivot = await asyncio.to_thread(
-                G.snap_to_pivot, df, end_price, kind, SNAP_TOLERANCE_PCT)
-
+        # Both prices snap to whichever side they are nearest: "from 4446 to 3235"
+        # names a high and a low, and forcing the low onto the highs missed it and
+        # silently fell back to the viewport end. Snapping and fitting share one
+        # fractal window, and the snap pool is the viewport, so the pivots the snap
+        # finds are pivots the fit can see.
         ctx_start, ctx_end = self._window(ctx)
+        start_pivot, end_pivot = await _snap_pair(
+            df, start_price, end_price, ctx_start, ctx_end, TRENDLINE_LEFT, TRENDLINE_RIGHT)
+
+        missing = [name for name, price, hit in
+                   (("from_price", start_price, start_pivot), ("to_price", end_price, end_pivot))
+                   if price and hit is None]
+        if missing:
+            raise RetryAgentRun(_missing_price_message(missing, df, ctx, ctx_start, ctx_end))
+
         window_start = start_pivot.time if start_pivot is not None else ctx_start
         window_end = end_pivot.time if end_pivot is not None else ctx_end
         if window_start is not None and window_end is not None and window_start > window_end:
             window_start, window_end = window_end, window_start
 
         pivot_highs, pivot_lows = await asyncio.to_thread(
-            G.swing_pivots, df, 3, 3, 0.0, window_start, window_end)
+            G.swing_pivots, df, TRENDLINE_LEFT, TRENDLINE_RIGHT, 0.0, window_start, window_end)
         pivots = pivot_highs if kind == "high" else pivot_lows
-        if len(pivots) < 2:
+        # The snapped pivots of the fitted side go into the candidate set whatever
+        # the recency cap does, which is what "fitted between the prices you named"
+        # has to mean. A snapped pivot of the other side only bounds the window.
+        required = [p for p in (start_pivot, end_pivot)
+                    if p is not None and getattr(p, "kind", "") == kind]
+        distinct = {(p.time, p.price) for p in pivots} | {(p.time, p.price) for p in required}
+        if len(distinct) < 2:
             yield (f"Fewer than two swing {kind}s in that range on {ctx.symbol} "
-                   f"{ctx.interval}, so there is nothing to draw a line through. Widen "
-                   "the lookback or the price range.")
+                   f"{ctx.interval}, so there is nothing to draw a line through. Zoom "
+                   "out to include more bars, or omit the prices and let the detector "
+                   "choose.")
             return
 
-        fit = await asyncio.to_thread(G.fit_trendline, pivots, 0.5)
+        fit = await asyncio.to_thread(G.fit_trendline, pivots, TREND_TOLERANCE_PCT, required)
         a, b = fit.get("from"), fit.get("to")
         if a is None or b is None:
-            a, b = pivots[0], pivots[-1]
+            ordered = sorted(pivots + required, key=lambda p: p.time)
+            a, b = ordered[0], ordered[-1]
 
         tone = "bearish" if b.price < a.price else "bullish"
         shape = Trendline(
@@ -1438,11 +1879,17 @@ class ChartTools(Toolkit):
         }
 
         yield ChartCommandEvent(commands=[draw_command(GROUP_TRENDLINE, [shape])])
+        snapped = []
+        for name, price, hit in (("from", start_price, start_pivot), ("to", end_price, end_pivot)):
+            if hit is not None:
+                snapped.append(f"{name} {_tidy(price)} snapped to the swing "
+                               f"{hit.kind or 'point'} at {hit.price:.2f}")
         yield (
-            f"Drew a {tone} trendline on {ctx.symbol} {ctx.interval} from "
-            f"{a.price:.2f} to {b.price:.2f}, {fit.get('touches', 2)} touches, "
-            f"r2 {_round(fit.get('r2'), 3)}"
+            f"Drew a {tone} trendline through the swing {kind}s on {ctx.symbol} "
+            f"{ctx.interval} from {a.price:.2f} to {b.price:.2f}, "
+            f"{fit.get('touches', 2)} touches, r2 {_round(fit.get('r2'), 3)}"
             + (", extended right." if extend else ".")
+            + (" " + "; ".join(snapped) + "." if snapped else "")
         )
 
     async def draw_levels(self, count: int = 4, lookback: int = DEFAULT_LOOKBACK,
@@ -1476,16 +1923,22 @@ class ChartTools(Toolkit):
         df = res["frame"]
 
         start, end = self._window(ctx)
-        found = await asyncio.to_thread(G.support_resistance, df, 0, 2, start, end)
+        # One reference price for both the role and the tone: the live last price
+        # when the browser sent one, else the last close. Reading the role off one
+        # number and the tone off another let a level be labelled resistance and
+        # coloured as support in the same breath.
+        reference = (ctx.last_price if ctx.last_price is not None
+                     else float(df["close"].iloc[-1]))
+        found = await asyncio.to_thread(
+            G.support_resistance, df, 0, 2, start, end, reference)
         if not found:
             yield (f"No level on {ctx.symbol} {ctx.interval} was touched twice in the "
-                   f"last {len(df)} bars, so there is nothing worth drawing.")
+                   f"visible bars, so there is nothing worth drawing.")
             return
 
         # support_resistance already returns strongest first: touch count, then most
         # recently touched. Re-ranking here would only undo that.
         chosen = [r for r in found if _finite(r.get("price")) is not None][:wanted]
-        last_price = ctx.last_price if ctx.last_price is not None else float(df["close"].iloc[-1])
         # UTC seconds, via the one conversion the whole system agrees on. OpenAlgo hands
         # daily bars back timezone-naive and intraday bars tz-aware Asia/Kolkata, so
         # calling Timestamp.timestamp() here would put daily levels five and a half
@@ -1497,17 +1950,20 @@ class ChartTools(Toolkit):
         for row in chosen:
             price = float(_finite(row.get("price")))
             touches = int(row.get("touches") or 0)
-            role = str(row.get("kind") or ("resistance" if price > last_price else "support"))
-            tone = "bearish" if price > last_price else "bullish"
+            role = str(row.get("kind") or ("resistance" if price >= reference else "support"))
+            side = str(row.get("side") or "")
+            tone = "bearish" if role == "resistance" else "bullish"
             shapes.append(Level(price=price, time=_finite(row.get("first_time")) or anchor_time,
                                 ray=False, label=f"{role} {price:.2f}", tone=tone))
-            described.append(f"{price:.2f} ({role}, {touches} touches)")
+            origin = f" from swing {side}s" if side else ""
+            described.append(f"{price:.2f} ({role}{origin}, {touches} touches)")
 
         _patterns(run_context)[GROUP_LEVELS] = {
             "kind": "levels", "group": GROUP_LEVELS,
             "symbol": ctx.symbol, "exchange": ctx.exchange, "interval": ctx.interval,
+            "reference": _round(reference),
             "levels": [{"price": _round(r.get("price")), "touches": r.get("touches"),
-                        "kind": r.get("kind")} for r in chosen],
+                        "kind": r.get("kind"), "side": r.get("side")} for r in chosen],
         }
 
         yield ChartCommandEvent(commands=[draw_command(GROUP_LEVELS, shapes)])
@@ -1600,24 +2056,44 @@ class ChartTools(Toolkit):
                 f"No {wanted} has been drawn in this session, so there is no geometry "
                 f"to measure. Currently stored: {drawn}. Call draw_envelope first."
             )
+        # A stored pattern is only as good as the chart it was drawn on. Refuse,
+        # plainly, when the instrument or interval changed underneath it, or when
+        # the browser says the user has already cleared it.
+        if not _matches_context(record, ctx):
+            yield _stale_sentence(wanted, record, ctx)
+            return
+        if not _on_chart(record, ctx):
+            yield (f"That {wanted} is no longer on the chart; the user cleared it. "
+                   "Call draw_envelope again before projecting targets.")
+            return
+        if record.get("kind") == "crossed":
+            yield (f"The two rails drawn on {ctx.symbol} {ctx.interval} cross inside "
+                   "the window, so that is a pattern that has already resolved, not a "
+                   "channel, and there is no height to project. Draw a fresh envelope "
+                   "over a range where the rails stay apart.")
+            return
         if record.get("kind") != "envelope":
             raise RetryAgentRun(
                 f"A measured move needs an envelope, and {wanted} is a "
                 f"{record.get('kind')}. Call draw_envelope first."
             )
 
-        env = _restore_envelope(record)
-        measured = await asyncio.to_thread(G.measured_move, env)
-        targets = _extract_targets(measured)
+        # The rails measured are the rails drawn: measured_move evaluates the stored
+        # lines at the right edge they were drawn to, so the breakout price narrated
+        # here is the upper rail's own right-edge price.
+        channel = _restore_channel(record)
+        measured = await asyncio.to_thread(G.measured_move, channel)
+        targets, dropped = _extract_targets(measured)
         if not targets:
             yield ("That envelope has no measurable height, so a measured move would "
                    "project nothing. Draw the envelope over a wider swing first.")
             return
 
         last_price = ctx.last_price
-        # The right edge of the pattern, plus its own duration: where the target would
-        # be reached if the move repeats the pattern's pace. It is a seat for the
-        # label, not a forecast of the date.
+        # The target rays start at the right edge of the drawn rails. The marker
+        # sits that edge plus the channel's own duration further on: where the
+        # target would be reached if the move repeats the pattern's pace. It is a
+        # seat for the label, not a forecast of the date.
         anchor_time = (_finite(measured.get("time"))
                        or _finite(record.get("last_time"))
                        or _finite(ctx.last_time) or 0.0)
@@ -1653,13 +2129,17 @@ class ChartTools(Toolkit):
         }
 
         yield ChartCommandEvent(commands=[draw_command(GROUP_TARGETS, shapes)])
-        yield (
+        text = (
             f"Projected the {_round(measured.get('width'))} point height of the "
-            f"{wanted} off both boundaries on {ctx.symbol} {ctx.interval}: "
+            f"{wanted} off both rails on {ctx.symbol} {ctx.interval}: "
             + ", ".join(described)
             + f". Break of {_round(measured.get('breakout'))} or "
               f"{_round(measured.get('breakdown'))} is what triggers them."
         )
+        if dropped:
+            text += (f" The {' and '.join(dropped)} would sit at or below zero, which "
+                     "is not a price, so it was not drawn.")
+        yield text
 
     # --- analysis -----------------------------------------------------------
 
@@ -1667,14 +2147,16 @@ class ChartTools(Toolkit):
                             run_context: RunContext | None = None) -> str:
         """Read the trend structure off the chart, with numbers. Draws nothing.
 
-        Reports direction, the slope of each envelope boundary, and whether the swing
-        highs and lows are actually making higher highs and higher lows.
+        Reports direction, the slope of each envelope boundary in price per bar, and
+        whether the swing highs and lows are actually making higher highs and higher
+        lows.
 
         Args:
             lookback (int): How many bars back to analyse. Defaults to 300.
 
         Returns:
-            str: JSON with direction, slopes, the pivot sequence and a structure verdict.
+            str: JSON with direction, slopes per bar, the pivot sequence and a
+                structure verdict.
         """
         ctx = read_context(run_context)
         if ctx is None:
@@ -1713,13 +2195,25 @@ class ChartTools(Toolkit):
         first, last = float(close.iloc[0]), float(close.iloc[-1])
         change_pct = round((last - first) / first * 100, 2) if first else None
 
+        # Geometry slopes are price per SECOND. A 0.5 point per day rally is
+        # 5.8e-06 per second, which rounds to 0.0 at four places, so every real
+        # trend read as flat. Scale by the frame's own bar spacing first.
+        bar_seconds = float(G.bar_interval_seconds(df.index))
+        slope_high = (_finite(env.get("slope_high")) or 0.0) * bar_seconds
+        slope_low = (_finite(env.get("slope_low")) or 0.0) * bar_seconds
+        sides = [s for s, count in ((slope_high, len(highs)), (slope_low, len(lows)))
+                 if count > 1]
+        slope_per_bar = sum(sides) / len(sides) if sides else 0.0
+
         return to_json(ok({
             "symbol": ctx.symbol, "exchange": ctx.exchange, "interval": ctx.interval,
             "bars_analysed": int(len(df)),
             "direction": env.get("direction"),
             "structure": structure,
-            "slope_high_per_bar": _round(env.get("slope_high"), 4),
-            "slope_low_per_bar": _round(env.get("slope_low"), 4),
+            "bar_seconds": _round(bar_seconds, 0),
+            "slope_per_bar": _round(slope_per_bar, 4),
+            "slope_high_per_bar": _round(slope_high, 4),
+            "slope_low_per_bar": _round(slope_low, 4),
             "envelope_width": _round(env.get("width")),
             "swing_highs": [_round(p.price) for p in highs],
             "swing_lows": [_round(p.price) for p in lows],
@@ -1794,14 +2288,15 @@ class ChartTools(Toolkit):
 
         Returns:
             str: JSON with the instrument, timeframe, loaded and visible ranges, every
-                indicator on the chart with its settings, and the analyst markup drawn
-                so far in this session.
+                indicator on the chart with its settings, and the analyst markup that
+                is on this chart now: drawn on this instrument and interval, and not
+                since cleared by the user.
         """
         ctx = read_context(run_context)
         if ctx is None:
             return NO_CHART
 
-        store = _patterns(run_context)
+        store = _visible_patterns(run_context, ctx)
         return to_json(ok({
             "symbol": ctx.symbol, "exchange": ctx.exchange, "interval": ctx.interval,
             "chart_type": ctx.chart_type,

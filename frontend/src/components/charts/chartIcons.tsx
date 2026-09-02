@@ -18,6 +18,10 @@
 import type { ReactNode } from "react"
 import {
   Activity,
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUp,
   ArrowUpRight,
   AudioWaveform,
   Brush,
@@ -241,6 +245,12 @@ const DRAW_TOOL_ICONS: Record<string, ChartIcon> = {
   "info-line": Ruler,
   "trend-angle": Triangle,
   arrow: ArrowUpRight,
+  // Named here because none of the fallbacks below know an arrow, and the last
+  // resort is a mouse pointer, which is the wrong picture for a direction.
+  "arrow-up": ArrowUp,
+  "arrow-down": ArrowDown,
+  "arrow-left": ArrowLeft,
+  "arrow-right": ArrowRight,
   "horizontal-line": HorizontalLineGlyph,
   "horizontal-ray": HorizontalRayGlyph,
   "vertical-line": VerticalLineGlyph,

@@ -8,14 +8,21 @@
  * always the slower of them.
  *
  * Facts this file is built around:
- *   - The elapsed time in "Thought for 27s" is measured here. No event carries
- *     it. The clock starts when the run opens, which is the closest observable
- *     instant to the first frame that the hook exposes, and stops the moment the
- *     first content token lands. Both readings are kept per turn index, because a
- *     finished turn keeps showing its own duration once the next one starts.
- *   - The turn index is found by scanning back for the last assistant message
- *     rather than taking messages.length - 1, so the timing survives a hook that
- *     appends the user turn without an empty assistant turn beside it.
+ *   - The "Thought for 27s" clock is not measured here. This column unmounts
+ *     when it is collapsed, and a measurement taken in it went with it: collapse
+ *     mid-run and every later turn read 0s. The page owns the readings, keyed
+ *     by turn index, and hands them down.
+ *   - Likewise the index of the last assistant turn is the page's, since the
+ *     page needs it for the clock. It is found by scanning back rather than
+ *     taking messages.length - 1, so the timing survives a hook that appends
+ *     the user turn without an empty assistant turn beside it.
+ *   - Nothing sends until the chart has reported ready. A starter clicked
+ *     before that went out with an empty context, and the analyst answered
+ *     about no chart at all.
+ *   - Memoised, with every callback it receives stable, so a page render that
+ *     is not about the conversation (a symbol change, a toast) does not touch
+ *     the transcript. Older turns are given one shared empty chip list so
+ *     AnalystMessage's own memo holds for them.
  *   - The textarea autogrows by the pattern in Composer.tsx: height is reset to 0
  *     before scrollHeight is read, because "auto" leaves the old box in place and
  *     the field then never shrinks again.
@@ -23,7 +30,7 @@
  *     space below it, the same trick App.tsx uses on the thread.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react"
+import { memo, useCallback, useEffect, useMemo, useRef, type KeyboardEvent } from "react"
 import { ArrowUp, PanelRightClose, Plus, Square } from "lucide-react"
 import type { ChatMessage } from "../../lib/sse"
 import type { Route } from "../Sidebar"
@@ -39,13 +46,25 @@ const STARTERS = [
   "Add supertrend 3,10"
 ]
 
+/** One shared instance, so a turn with no chips keeps a referentially equal prop. */
+const NO_CHIPS: ActionChip[] = []
+
 interface AnalystPanelProps {
   messages: ChatMessage[]
   running: boolean
+  /** True once the chart has reported ready. Until then nothing is sent. */
+  ready: boolean
   /** Named back at the user in the header and in the follow-up chips, so a
    *  wrong-symbol answer is caught by reading one line. */
   symbol: string
   interval: string
+  /** Index of the newest assistant turn, or -1. Owned by the page. */
+  lastAssistant: number
+  /** Elapsed seconds per turn index, measured by the page. */
+  seconds: Record<number, number>
+  /** True when the chart changed after the newest turn finished, so chips
+   *  bound to what that turn drew are no longer offered. */
+  chipsStale: boolean
   onSend: (text: string) => void
   onStop: () => void
   onReset: () => void
@@ -55,11 +74,15 @@ interface AnalystPanelProps {
   onNavigate?: (target: Route) => void
 }
 
-export default function AnalystPanel({
+function AnalystPanel({
   messages,
   running,
+  ready,
   symbol,
   interval,
+  lastAssistant,
+  seconds,
+  chipsStale,
   onSend,
   onStop,
   onReset,
@@ -68,43 +91,6 @@ export default function AnalystPanel({
 }: AnalystPanelProps) {
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
-  const startedRef = useRef<number | null>(null)
-  const [seconds, setSeconds] = useState<Record<number, number>>({})
-
-  const lastAssistant = useMemo(() => {
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      if (messages[index].role === "assistant") return index
-    }
-    return -1
-  }, [messages])
-
-  const answered = lastAssistant >= 0 && Boolean(messages[lastAssistant].content)
-
-  // Start on the first sign of the turn.
-  useEffect(() => {
-    if (running && startedRef.current === null) startedRef.current = Date.now()
-  }, [running])
-
-  // Stop when the answer begins, or when the run ends having produced none.
-  useEffect(() => {
-    const started = startedRef.current
-    if (started === null) return
-    if (running && !answered) return
-    startedRef.current = null
-    if (lastAssistant < 0) return
-    const elapsed = Math.max(0, Math.round((Date.now() - started) / 1000))
-    setSeconds((current) =>
-      current[lastAssistant] === undefined ? { ...current, [lastAssistant]: elapsed } : current
-    )
-  }, [running, answered, lastAssistant])
-
-  // A new thread drops every measurement with the transcript it belonged to.
-  useEffect(() => {
-    if (messages.length === 0) {
-      startedRef.current = null
-      setSeconds({})
-    }
-  }, [messages.length])
 
   useEffect(() => {
     const container = scrollRef.current
@@ -130,11 +116,11 @@ export default function AnalystPanel({
     const element = inputRef.current
     if (!element) return
     const text = element.value.trim()
-    if (!text || running) return
+    if (!text || running || !ready) return
     onSend(text)
     element.value = ""
     resize()
-  }, [running, onSend, resize])
+  }, [running, ready, onSend, resize])
 
   const onKeyDown = useCallback(
     (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -152,18 +138,19 @@ export default function AnalystPanel({
         onNavigate?.(chip.target)
         return
       }
-      if (!running) onSend(chip.prompt)
+      if (!running && ready) onSend(chip.prompt)
     },
-    [running, onSend, onNavigate]
+    [running, ready, onSend, onNavigate]
   )
 
   // Only the newest answered turn offers follow-ups, and a navigating one is
   // dropped when the host gave no way to navigate.
   const chips = useMemo(() => {
-    if (running || lastAssistant < 0) return []
-    const suggested = suggestChips(messages[lastAssistant], { symbol, interval })
-    return onNavigate ? suggested : suggested.filter((chip) => chip.kind !== "navigate")
-  }, [running, lastAssistant, messages, symbol, interval, onNavigate])
+    if (running || lastAssistant < 0) return NO_CHIPS
+    const suggested = suggestChips(messages[lastAssistant], { symbol, interval, stale: chipsStale })
+    const offered = onNavigate ? suggested : suggested.filter((chip) => chip.kind !== "navigate")
+    return offered.length === 0 ? NO_CHIPS : offered
+  }, [running, lastAssistant, messages, symbol, interval, chipsStale, onNavigate])
 
   return (
     <aside className="flex h-full w-[380px] shrink-0 flex-col border-l border-border bg-sidebar">
@@ -209,8 +196,10 @@ export default function AnalystPanel({
                 <button
                   key={starter}
                   type="button"
+                  disabled={!ready}
                   onClick={() => onSend(starter)}
-                  className="rounded-full border border-border px-2.5 py-1 text-left text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+                  title={ready ? starter : "Waiting for the chart to load"}
+                  className="rounded-full border border-border px-2.5 py-1 text-left text-xs text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40"
                 >
                   {starter}
                 </button>
@@ -224,7 +213,7 @@ export default function AnalystPanel({
               message={message}
               running={running && index === lastAssistant}
               seconds={seconds[index] ?? null}
-              chips={index === lastAssistant ? chips : []}
+              chips={index === lastAssistant ? chips : NO_CHIPS}
               onChip={onChip}
             />
           ))
@@ -243,19 +232,23 @@ export default function AnalystPanel({
             rows={1}
             onInput={resize}
             onKeyDown={onKeyDown}
-            placeholder="Ask about this chart"
+            placeholder={ready ? "Ask about this chart" : "Waiting for the chart to load"}
             className="scroll-thin max-h-[160px] w-full resize-none bg-transparent px-1.5 py-1 text-sm outline-none placeholder:text-muted-foreground"
           />
           <div className="flex items-center justify-between gap-2 px-0.5 pt-1">
             <span className="text-[11px] text-muted-foreground">Nothing here can place an order</span>
             <button
               type="button"
+              disabled={!running && !ready}
               onClick={running ? onStop : submit}
               className={cn(
-                "flex h-7 w-7 items-center justify-center rounded-full text-primary-foreground",
+                "flex h-7 w-7 items-center justify-center rounded-full text-primary-foreground disabled:opacity-40",
                 running ? "bg-danger" : "bg-primary"
               )}
               aria-label={running ? "Stop the run" : "Send the question"}
+              title={
+                running ? "Stop the run" : ready ? "Send the question" : "Waiting for the chart to load"
+              }
             >
               {running ? (
                 <Square className="h-3 w-3 shrink-0" />
@@ -269,3 +262,5 @@ export default function AnalystPanel({
     </aside>
   )
 }
+
+export default memo(AnalystPanel)

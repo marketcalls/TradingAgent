@@ -13,7 +13,10 @@
  *     canvas 2D context that cannot parse it silently keeps the previous
  *     fillStyle rather than throwing. Every assignment is therefore sandwiched
  *     between a sentinel and a read-back, so an unparseable token falls to a
- *     known-good literal instead of painting the sentinel.
+ *     known-good literal instead of painting the sentinel. The probe element's
+ *     inline style is the parse check on the way in: an unparseable value is
+ *     dropped on assignment, while the computed colour would inherit and never
+ *     read as empty.
  *
  * A DrawingStyle stores a literal colour string, so nothing here re-tints an
  * existing drawing: the terminal has to re-issue its AI drawings on a theme
@@ -93,8 +96,12 @@ function composite(value: string, base: string, fallback: string): string {
   if (!ensureProbe() || pixel === null || probe === null) return fallback
   probe.style.color = ""
   probe.style.color = value
+  // The inline declaration is the parse check: a value the engine cannot parse
+  // is dropped on assignment and reads back as "". The computed colour never
+  // does, because an unset colour inherits, so a guard on it was dead code and
+  // an unparseable token reached the canvas as the inherited text colour.
+  if (probe.style.color === "") return fallback
   const resolved = getComputedStyle(probe).color
-  if (resolved === "") return fallback
   pixel.clearRect(0, 0, 1, 1)
   if (!accepts(base)) return fallback
   pixel.fillRect(0, 0, 1, 1)

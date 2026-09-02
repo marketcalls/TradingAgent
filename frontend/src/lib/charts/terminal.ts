@@ -1,7 +1,7 @@
 /** The chart engine, as a plain class React never looks inside.
  *
  * There is no React import in this file and there must never be one. The engine
- * is a mutable object graph with a running animation loop, and a depth stream
+ * is a mutable object graph with a running animation loop, and a quote stream
  * pushes a new price several times a second; routing either through setState
  * would re-render the page at tick rate and ask React to diff an object it
  * cannot compare. Only the low-frequency, UI-shaped events in TerminalCallbacks
@@ -17,9 +17,15 @@
  *     leave the next chart in that container un-pannable.
  *   - A chart rebuild is a full teardown. Drawings, indicators, the volume
  *     preference and the price-scale mode all belong to the chart that just went
- *     away, so they are snapshotted before and re-applied in the rebuild tail.
- *     Only a chart-type change rebuilds: setTheme is a live swap and an interval
- *     change is a data reload, both of which keep the user's zoom.
+ *     away, so they are snapshotted before and re-applied in the rebuild tail,
+ *     indicators first: a drawing on an indicator pane names that pane by index
+ *     and addPrimitive creates the pane it names, so restoring drawings first
+ *     conjured an empty pane and pushed the re-added indicator below it.
+ *   - Only a chart-type change rebuilds. setTheme is a live swap and an interval
+ *     change is a data reload, and all three keep the user's zoom: the visible
+ *     span and the gap past the last bar are captured before the data moves and
+ *     put back after it lands. Only the first load and a symbol change frame
+ *     the viewport afresh.
  *   - setHistoryLoader latches after one call and re-arms only on
  *     historyLoadComplete, so every exit from the pager reports back or
  *     scroll-back paging stops for the rest of the session, silently.
@@ -30,7 +36,38 @@
  *     the theme is passed explicitly on creation and again on every swap.
  *   - Drawings never expand the price scale (their autoscaleInfo returns null),
  *     so markup drawn off-screen stays off-screen. "focus" moves the time window
- *     and re-arms autoscale, which is the whole remedy the engine offers.
+ *     and re-arms autoscale, which is the whole remedy the engine offers. The
+ *     engine drops setVisibleLogicalRange at width 0, so a focus that lands
+ *     while the page is hidden is held and applied on the next real resize.
+ *   - withBarCache serves CLOSED bars only: it strips the forming bar on store,
+ *     and a hit inside the TTL is short by that bar. The primary series is
+ *     therefore always fetched fresh; the cache fronts scroll-back paging alone,
+ *     where every bar is immutable.
+ *   - The tick stream is not the whole truth. A Quote frame carries the day's
+ *     cumulative volume, which the builder diffs per bar, but a missed tick, a
+ *     hidden tab or a relay reconnect leaves closed bars that were never built.
+ *     A history reconcile every 25 to 35 seconds (jittered so a fleet of tabs
+ *     does not poll in step), and at once after every stream restart, snaps the
+ *     closed bars to the broker's OHLC and volume and re-seeds the builder for
+ *     the forming bar. The builder folds every later tick into its own copy of
+ *     that bar, so a correction written to rawBars alone is gone on the next tick.
+ *   - DrawingController pushes one undo snapshot per add, update and remove,
+ *     and 1.9.2 has no batch API. Analyst maintenance therefore costs the user
+ *     undo entries; the history limit is raised to absorb it.
+ *   - DrawingController keys its layers by pane index and its constructor
+ *     restores the chart's own drawings slot. Removing an indicator's pane
+ *     renumbers the panes underneath both, so the controller is rebuilt with
+ *     the indices moved down, and the slot is written first or the constructor
+ *     conjures an empty pane from the stale index.
+ *   - DrawingController.add does no duplicate-id check: a second drawing under
+ *     an id already on the chart is drawn beside the first. Appending to an
+ *     analyst group (the "notes" group grows one label per call) therefore
+ *     numbers its new ids after the ones already there, never from zero.
+ *   - The built-in bollinger declares no fills where every other band indicator
+ *     does, so "shade the bands" was refused. indicatorOverrides registers a
+ *     fill-enabled copy under the same id, and it runs the moment the
+ *     indicators tier loads and before any catalogue read, so the picker, the
+ *     persisted layouts and the analyst all see one bollinger.
  */
 
 import {
@@ -57,7 +94,7 @@ import {
 import type { Drawing, DrawingController, DrawingStyle } from "openalgo-charts/draw"
 import type { ISeriesTransform } from "openalgo-charts/transform"
 import { formatNumber } from "../format"
-import { annotationSpan, buildAnnotations, inGroup } from "./annotations"
+import { annotationSpan, buildAnnotations, inGroup, nextGroupIndex } from "./annotations"
 import {
   ProxyDataFeed,
   OaSocket,
@@ -70,11 +107,14 @@ import {
   socketUrl,
   type SymbolInfo
 } from "./feed"
+import { applyIndicatorOverrides } from "./indicatorOverrides"
 import {
+  DEFAULT_INTERVAL,
   emptyIntervals,
   flattenIntervals,
   historyRange,
   intervalSeconds,
+  lookbackDays,
   pickInterval
 } from "./intervals"
 import {
@@ -196,6 +236,21 @@ const VISIBLE_BARS = 180
  *  every tick; only the crossing into the render cycle is rate limited. */
 const PRICE_PUSH_MS = 250
 
+/** The history reconcile cadence. 25 to 35 seconds, the same window OpenAlgo's
+ *  own terminal uses, jittered so every open tab does not poll in step. */
+const RECONCILE_BASE_MS = 25000
+const RECONCILE_JITTER_MS = 10000
+
+/** Days of history a reconcile re-asks for. Enough to cover a hidden tab's
+ *  afternoon at any intraday interval; a daily series gets two or three bars. */
+const RECONCILE_MAX_DAYS = 3
+
+/** Undo depth. The engine's default is 50 and every analyst add, update and
+ *  remove costs one entry: a thirty-shape analysis replaced by a thirty-shape
+ *  one is sixty entries, and a theme swap over it is up to thirty more. There
+ *  is no batch API in 1.9.2, so the depth absorbs the cost instead. */
+const UNDO_DEPTH = 500
+
 const DEFAULT_SYMBOL = "RELIANCE"
 const DEFAULT_EXCHANGE = "NSE"
 
@@ -207,6 +262,16 @@ function describe(error: unknown): string {
 
 function chartTypeDef(value: string): ChartTypeDef {
   return CHART_TYPES.find((entry) => entry.value === value) ?? CHART_TYPES[0]
+}
+
+function sameBar(a: Bar, b: Bar): boolean {
+  return (
+    a.open === b.open &&
+    a.high === b.high &&
+    a.low === b.low &&
+    a.close === b.close &&
+    (a.volume ?? 0) === (b.volume ?? 0)
+  )
 }
 
 /** One descriptor input as the settings form wants it, with the live value. */
@@ -236,6 +301,14 @@ interface LegendNodes {
   ohlc: HTMLSpanElement
   volume: HTMLSpanElement
   change: HTMLSpanElement
+}
+
+/** What of the viewport survives a data change. Logical indices belong to one
+ *  series and cannot cross a reload; the zoom (bars in view) and the gap past
+ *  the last bar can. */
+interface ViewSnapshot {
+  span: number
+  rightGap: number
 }
 
 export class ChartTerminal implements TerminalApi {
@@ -270,7 +343,12 @@ export class ChartTerminal implements TerminalApi {
     exchange: DEFAULT_EXCHANGE,
     quoteOnly: false
   }
-  private interval = "5m"
+  /** True once symbolInfo came from the proxy rather than from storage. */
+  private symbolLoaded = false
+  /** The instrument the user or the analyst last asked for. Set the moment it is
+   *  asked for; symbolInfo follows once the metadata has loaded. */
+  private target = { symbol: DEFAULT_SYMBOL, exchange: DEFAULT_EXCHANGE }
+  private interval = DEFAULT_INTERVAL
   private chartTypeId = "candlestick"
   private intervals: IntervalGroups = emptyIntervals()
 
@@ -287,10 +365,26 @@ export class ChartTerminal implements TerminalApi {
   private volumeVisible = true
   private scaleMode: PriceScaleMode = "linear"
 
+  /** Every view change runs on this chain, in order. */
+  private chain: Promise<void> = Promise.resolve()
+  /** Latest-wins token for the data-loading view changes. */
+  private viewGen = 0
+  /** Which rebuild a restoreAfterBuild belongs to. */
+  private buildGen = 0
   private loadToken = 0
   private loadingOlder = false
   private noMoreHistory = false
   private destroyed = false
+
+  /** The transform box size for the series as loaded. Fixed per load: derived
+   *  per tick from the last close, renko re-bricked the whole history on every
+   *  tick and the view jumped with it. */
+  private box: number | null = null
+
+  private reconcileTimer: ReturnType<typeof setTimeout> | null = null
+
+  /** A focus that arrived at width 0 and waits for a real resize. */
+  private pendingFocus: { from: number; to: number } | null = null
 
   private legend: LegendNodes | null = null
   /** Seeded with the library's light values so a read before the first
@@ -305,6 +399,10 @@ export class ChartTerminal implements TerminalApi {
   private readonly sessionOff: (() => void)[] = []
   /** Unsubscribes belonging to the current chart. Cleared on every rebuild. */
   private readonly chartOff: (() => void)[] = []
+  /** Unsubscribes belonging to the current drawing controller, which can be
+   *  re-attached to the same chart (a pane removal rebuilds it). Kept apart from
+   *  chartOff so a re-attach does not stack a second set of listeners. */
+  private readonly drawOff: (() => void)[] = []
 
   constructor(options: TerminalOptions) {
     this.container = options.container
@@ -339,6 +437,7 @@ export class ChartTerminal implements TerminalApi {
     if (symbol !== null && exchange !== null) {
       this.symbolInfo = { symbol, exchange, quoteOnly: false }
     }
+    this.target = { symbol: this.symbolInfo.symbol, exchange: this.symbolInfo.exchange }
     const interval = this.read("interval")
     if (interval !== null) this.interval = interval
     const chartType = this.read("charttype")
@@ -367,6 +466,27 @@ export class ChartTerminal implements TerminalApi {
     } catch {
       this.drawJson = []
     }
+    // The semantic shapes behind the analyst's drawings. Without them a reload
+    // restores the drawings but not what they mean, and a theme swap can no
+    // longer re-tint them.
+    try {
+      const raw = this.read("ai-groups")
+      const parsed: unknown = raw === null ? null : JSON.parse(raw)
+      if (Array.isArray(parsed)) {
+        for (const entry of parsed) {
+          if (!Array.isArray(entry) || entry.length !== 2) continue
+          const [group, shapes] = entry as [unknown, unknown]
+          if (typeof group !== "string" || !Array.isArray(shapes)) continue
+          this.aiGroups.set(group, shapes as AnnotationShape[])
+        }
+      }
+    } catch {
+      this.aiGroups.clear()
+    }
+  }
+
+  private storeAiGroups(): void {
+    this.store("ai-groups", JSON.stringify([...this.aiGroups.entries()]))
   }
 
   /* lifecycle */
@@ -386,22 +506,33 @@ export class ChartTerminal implements TerminalApi {
     }
     if (this.destroyed) return
 
+    let intervalsError: string | null = null
     try {
       this.intervals = await getIntervals()
     } catch (error) {
-      this.cb.onToast(describe(error), "error")
+      intervalsError = describe(error)
     }
     if (this.destroyed) return
     this.interval = pickInterval(this.intervals, this.interval)
+    if (flattenIntervals(this.intervals).length === 0) {
+      // An empty list is an unavailable list. The saved interval is kept and
+      // the picker validates nothing until the list arrives on a later visit.
+      const why = intervalsError === null ? "the broker offered no intervals" : intervalsError
+      this.cb.onToast(`${why}; keeping ${this.interval}`, "error")
+    }
 
     const socket = new OaSocket(socketUrl(wsPath))
     this.socket = socket
     this.sessionOff.push(socket.onState((state) => this.reportWs(state)))
+    // Transient only: a fatal code arrives as the "auth failed" state instead.
+    this.sessionOff.push(socket.onError((_code, message) => this.cb.onToast(message, "error")))
     this.live = new ProxyDataFeed(socket)
-    // Warm loading matters here because the same series is reloaded constantly:
-    // interval pills, a symbol flicked and flicked back, a page refresh. The
-    // cache never stores the forming bar, so a hit is short by at most the bar
-    // the live subscription is about to supply anyway.
+    // The cache fronts scroll-back paging ONLY. It never stores the forming
+    // bar, so a hit is short by exactly the bar the chart is watching: a reload
+    // served from it dropped the forming bar, rebuilt it from ticks with the
+    // wrong open and no volume, and at 18:00 a D to 5m to D flick lost the day's
+    // candle outright. reload() goes to the wire; pageHistory, whose bars are
+    // immutable, is what warm loading is for.
     this.feed = withBarCache(this.live, { ttlMs: 60000, max: 16 })
     socket.connect()
 
@@ -415,10 +546,10 @@ export class ChartTerminal implements TerminalApi {
       if (this.destroyed) return
     }
 
-    this.build()
-    await this.loadSymbolInfo(this.symbolInfo.symbol, this.symbolInfo.exchange)
-    if (this.destroyed) return
-    await this.reload()
+    this.build(false)
+    // On the same chain as every later view change, so a symbol picked while
+    // the first history is in flight lands after it rather than beside it.
+    await this.enqueue((gen) => this.loadView(gen, true), true)
     if (this.destroyed) return
     this.cb.onReady({
       intervals: this.intervals,
@@ -430,6 +561,7 @@ export class ChartTerminal implements TerminalApi {
   destroy(): void {
     if (this.destroyed) return
     this.destroyed = true
+    this.stopReconcile()
     // First, and by hand. chart.destroy() leaves a DrawingController running,
     // and a leaked one can strand placement mode on.
     this.detachDrawing()
@@ -448,6 +580,51 @@ export class ChartTerminal implements TerminalApi {
     this.volume = null
     this.legend = null
     this.legendEl.textContent = ""
+  }
+
+  /* the view chain */
+
+  /** Run one view change after every earlier one.
+   *
+   *  A data-loading change (symbol, interval) takes a fresh generation and is
+   *  skipped, or abandoned after its next await, once a later one exists: the
+   *  later change reads the same target fields and does everything the earlier
+   *  one would have. A chart-type change is serialised but never superseded,
+   *  because a symbol change that follows it does not rebuild the chart. Two
+   *  quick symbol picks used to race their metadata fetches and could end on
+   *  the first, with the toolbar and the saved symbol both wrong.
+   */
+  private enqueue(task: (gen: number) => Promise<void>, bump: boolean): Promise<void> {
+    const gen = bump ? ++this.viewGen : this.viewGen
+    const run = this.chain.then(async () => {
+      if (this.destroyed) return
+      if (bump && gen !== this.viewGen) return
+      await task(gen)
+    })
+    this.chain = run.catch(() => undefined)
+    return run
+  }
+
+  private stale(gen: number): boolean {
+    return this.destroyed || gen !== this.viewGen
+  }
+
+  /** Bring the chart to the target symbol and the current interval. */
+  private async loadView(gen: number, frame: boolean): Promise<void> {
+    const target = this.target
+    const changed =
+      target.symbol !== this.symbolInfo.symbol || target.exchange !== this.symbolInfo.exchange
+    if (changed || !this.symbolLoaded) {
+      this.teardownLive()
+      this.stopReconcile()
+      if (changed) {
+        this.prevClose = null
+        this.lastPrice = null
+      }
+      await this.loadSymbolInfo(target.symbol, target.exchange, gen)
+      if (this.stale(gen)) return
+    }
+    await this.reload(gen, frame || changed)
   }
 
   /* tiers */
@@ -488,6 +665,11 @@ export class ChartTerminal implements TerminalApi {
     if (this.indicatorTier) return true
     try {
       await import("openalgo-charts/indicators")
+      // Every time the tier lands, before the destroyed check and before any
+      // read of the registry: registration is idempotent, and a terminal torn
+      // down mid-import must not leave the registry half overridden for the
+      // next one, which would skip the import and read the built-in bollinger.
+      applyIndicatorOverrides()
     } catch (error) {
       this.cb.onToast(describe(error), "error")
       return false
@@ -513,7 +695,10 @@ export class ChartTerminal implements TerminalApi {
     return {}
   }
 
-  private build(): void {
+  /** Create the chart. `keepView` carries the zoom across a rebuild; false
+   *  frames the series afresh, which only the first build wants. */
+  private build(keepView: boolean): void {
+    const view = keepView ? this.captureView() : null
     // Snapshot before the chart the drawings live on goes away.
     this.detachDrawing()
     for (const off of this.chartOff) off()
@@ -528,7 +713,12 @@ export class ChartTerminal implements TerminalApi {
       // This terminal draws its own OHLC readout over the pane's top-left
       // corner, so indicator legend rows have to start below it or their gear
       // and close buttons land underneath and cannot be clicked.
-      legendOffset: { top: 34, left: 10 }
+      legendOffset: { top: 34, left: 10 },
+      // Alt+H and Alt+V arm the horizontal-line and vertical-line drawing
+      // tools, and the engine's default keymap binds the same two combos to
+      // the grid toggles, so every line tool armed by keyboard also flipped a
+      // grid. The grid keeps no keyboard binding; the tools keep theirs.
+      shortcuts: { disabledCommands: ["toggleGridHorz", "toggleGridVert"] }
     })
     this.chart = chart
 
@@ -553,7 +743,8 @@ export class ChartTerminal implements TerminalApi {
     }
 
     this.setPriceData()
-    this.frameViewport()
+    if (keepView) this.restoreView(view)
+    else this.frameViewport()
 
     chart.subscribeCrosshairMove((event) => this.writeLegend(event.bar))
     this.chartOff.push(
@@ -566,31 +757,48 @@ export class ChartTerminal implements TerminalApi {
     // this class. Without this the tracked list keeps it, and the next rebuild
     // brings the deleted indicator back.
     this.chartOff.push(chart.on("indicatorRemoved", () => this.syncIndicators()))
+    // Removing the last indicator on a pane removes the pane, from either path.
+    this.chartOff.push(
+      chart.on("paneRemoved", (payload) => {
+        const pane = (payload as { paneIndex?: unknown }).paneIndex
+        if (typeof pane === "number") this.rehomeDrawings(pane)
+      })
+    )
+    this.chartOff.push(chart.on("resize", (payload) => this.onResize(payload)))
     chart.setHistoryLoader(() => void this.pageHistory())
 
     this.buildLegend()
     this.writeLegend(null)
-    void this.restoreAfterBuild()
+    void this.restoreAfterBuild(++this.buildGen)
   }
 
-  /** Everything a rebuild threw away, put back in the order it is wanted. */
-  private async restoreAfterBuild(): Promise<void> {
+  /** Everything a rebuild threw away, put back in the order it is wanted.
+   *
+   *  Indicators before drawings: a drawing on an indicator pane names the pane
+   *  by index and addPrimitive creates the pane it names, so the other order
+   *  conjured an empty pane and displaced the indicator being re-added. The
+   *  generation drops the restoration of a rebuild that was overlapped by a
+   *  newer one, which used to re-add every indicator twice. */
+  private async restoreAfterBuild(gen: number): Promise<void> {
+    await this.reapplyIndicators(gen)
+    if (this.destroyed || gen !== this.buildGen) return
     await this.ensureDrawing()
-    if (this.destroyed) return
-    await this.reapplyIndicators()
   }
 
   /* data */
 
-  private boxSize(): number {
-    const last = this.rawBars.length > 0 ? this.rawBars[this.rawBars.length - 1].close : 100
+  private boxSizeFor(lastClose: number): number {
     const tick = this.tickSize()
-    const stepped = Math.round((last * 0.0015) / tick) * tick
+    const stepped = Math.round((lastClose * 0.0015) / tick) * tick
     return Math.max(tick, Number(stepped.toFixed(this.decimals())))
   }
 
   private makeTransform(kind: TransformKind, tier: TransformTier): ISeriesTransform {
-    const box = this.boxSize()
+    // Fixed at load. Re-deriving it from each tick's close re-bricked renko on
+    // every tick; a chart type switched on mid-session gets the loaded value.
+    const box =
+      this.box ??
+      this.boxSizeFor(this.rawBars.length > 0 ? this.rawBars[this.rawBars.length - 1].close : 100)
     switch (kind) {
       case "heikin-ashi":
         return new tier.HeikinAshiTransform()
@@ -682,6 +890,30 @@ export class ChartTerminal implements TerminalApi {
     chart.setVisibleLogicalRange({ from: right - span, to: right })
   }
 
+  private captureView(): ViewSnapshot | null {
+    const chart = this.chart
+    if (chart === null || this.shownBars.length === 0) return null
+    const range = chart.getVisibleLogicalRange()
+    if (!Number.isFinite(range.from) || !Number.isFinite(range.to)) return null
+    const span = range.to - range.from
+    if (!(span > 0)) return null
+    return { span, rightGap: range.to - (this.shownBars.length - 1) }
+  }
+
+  /** Put a captured zoom back over whatever series is loaded now. With nothing
+   *  captured (an empty chart before, or a hidden page) the series is framed. */
+  private restoreView(view: ViewSnapshot | null): void {
+    if (view === null) {
+      this.frameViewport()
+      return
+    }
+    const chart = this.chart
+    const count = this.shownBars.length
+    if (chart === null || count === 0) return
+    const to = count - 1 + view.rightGap
+    chart.setVisibleLogicalRange({ from: to - view.span, to })
+  }
+
   private teardownLive(): void {
     if (this.offBars !== null) {
       this.offBars()
@@ -695,33 +927,39 @@ export class ChartTerminal implements TerminalApi {
     this.cb.onWsState(state)
   }
 
-  private async loadSymbolInfo(symbol: string, exchange: string): Promise<void> {
+  private async loadSymbolInfo(symbol: string, exchange: string, gen: number): Promise<void> {
     const info = await getSymbolInfo(symbol, exchange)
-    if (this.destroyed) return
+    if (this.stale(gen)) return
     this.symbolInfo = info
+    this.symbolLoaded = true
     this.store("symbol", info.symbol)
     this.store("exchange", info.exchange)
+    // Both halves of the price format travel with the symbol. The series was
+    // created with the previous instrument's tick, and pushing precision alone
+    // left a 0.05 ladder under a 0.25 instrument.
     this.price?.applyOptions({ precision: this.decimals() })
+    this.chart?.setPriceScaleOptions({ minMove: this.tickSize() }, "primary")
     this.buildLegend()
     this.cb.onSymbolLoaded({ symbol: info.symbol, exchange: info.exchange, name: info.name })
   }
 
   /** Reload history for the current symbol and interval, then resubscribe.
    *
-   *  A token guards against a slow response for a symbol the user has already
-   *  moved off: without it, an interval flicked twice can land the first
-   *  response after the second and chart the wrong timeframe.
+   *  Straight to the wire, never through the cache: a cached series is closed
+   *  bars only. The load token guards the pager and the reconcile, which are
+   *  not on the view chain; the generation guards against a newer view change.
    */
-  private async reload(): Promise<void> {
-    const feed = this.feed
-    if (feed === null) return
+  private async reload(gen: number, frame: boolean): Promise<void> {
+    const live = this.live
+    if (live === null) return
     const token = ++this.loadToken
     this.teardownLive()
+    this.stopReconcile()
     const to = nowSec()
     const range = historyRange(this.interval, to)
-    let bars: Bar[] = []
+    let bars: Bar[]
     try {
-      bars = await feed.getBars({
+      bars = await live.getBars({
         symbol: this.symbolInfo.symbol,
         exchange: this.symbolInfo.exchange,
         interval: this.interval,
@@ -729,18 +967,35 @@ export class ChartTerminal implements TerminalApi {
         to: range.to
       })
     } catch (error) {
-      if (this.destroyed || token !== this.loadToken) return
+      if (this.stale(gen) || token !== this.loadToken) return
+      // The previous bars stay, un-subscribed. A blank chart with an
+      // epoch-anchored live series under it told the user less than the last
+      // good series and a toast do.
       this.cb.onToast(describe(error), "error")
+      return
     }
-    if (this.destroyed || token !== this.loadToken) return
+    if (this.stale(gen) || token !== this.loadToken) return
     this.rawBars = bars
     this.noMoreHistory = false
+    this.box = bars.length > 0 ? this.boxSizeFor(bars[bars.length - 1].close) : null
+    const view = frame ? null : this.captureView()
     this.setPriceData()
-    this.frameViewport()
+    if (frame) this.frameViewport()
+    else this.restoreView(view)
     this.lastPrice = bars.length > 0 ? bars[bars.length - 1].close : null
     if (this.lastPrice !== null) this.cb.onLastPrice(this.lastPrice)
     this.writeLegend(null)
-    this.subscribeLive()
+    if (bars.length === 0) {
+      // Nothing to anchor a live bucket to, and a series that starts from a
+      // tick has no open, no history and no session grid.
+      this.cb.onToast(
+        `no ${this.interval} history for ${this.symbolInfo.exchange}:${this.symbolInfo.symbol}`,
+        "info"
+      )
+    } else {
+      this.subscribeLive()
+      this.scheduleReconcile()
+    }
     void this.refreshQuote(token)
   }
 
@@ -770,8 +1025,21 @@ export class ChartTerminal implements TerminalApi {
         interval: this.interval
       },
       (bar) => this.onLiveBar(bar),
-      { seedFrom: seed }
+      {
+        seedFrom: seed,
+        onSnapshot: (price) => this.onSnapshotPrice(price),
+        onResync: () => this.reconcileNow()
+      }
     )
+  }
+
+  /** A price that must not become a bar: the subscribe-time snapshot, or a
+   *  reading stamped before the forming bar opened. */
+  private onSnapshotPrice(price: number): void {
+    if (this.destroyed) return
+    this.lastPrice = price
+    this.cb.onLastPrice(price)
+    this.writeLegend(null)
   }
 
   private onLiveBar(bar: Bar): void {
@@ -813,6 +1081,122 @@ export class ChartTerminal implements TerminalApi {
     this.writeLegend(null)
   }
 
+  /* the history reconcile */
+
+  private stopReconcile(): void {
+    if (this.reconcileTimer !== null) {
+      clearTimeout(this.reconcileTimer)
+      this.reconcileTimer = null
+    }
+  }
+
+  private scheduleReconcile(): void {
+    this.stopReconcile()
+    const delay = RECONCILE_BASE_MS + Math.random() * RECONCILE_JITTER_MS
+    this.reconcileTimer = setTimeout(() => void this.runReconcile(), delay)
+  }
+
+  /** The stream just restarted: whatever closed during the gap was never built
+   *  from ticks, so re-ask now rather than sit on the hole for half a minute. */
+  private reconcileNow(): void {
+    if (this.offBars === null) return
+    this.stopReconcile()
+    this.reconcileTimer = setTimeout(() => void this.runReconcile(), 0)
+  }
+
+  private async runReconcile(): Promise<void> {
+    this.reconcileTimer = null
+    const live = this.live
+    if (live === null || this.destroyed || this.offBars === null) return
+    if (this.rawBars.length === 0) return
+    const token = this.loadToken
+    const req = {
+      symbol: this.symbolInfo.symbol,
+      exchange: this.symbolInfo.exchange,
+      interval: this.interval
+    }
+    const to = nowSec()
+    try {
+      const fresh = await live.getBars({
+        ...req,
+        from: to - Math.min(RECONCILE_MAX_DAYS, lookbackDays(this.interval)) * 86400,
+        to
+      })
+      if (this.destroyed || token !== this.loadToken) return
+      if (this.applyReconcile(fresh)) {
+        this.setPriceData()
+        this.writeLegend(null)
+      }
+    } catch {
+      // The next cycle retries. A reconcile that fails is a chart that is a
+      // few bars behind the broker, which is where it was before it ran.
+    }
+    if (this.destroyed || token !== this.loadToken || this.offBars === null) return
+    this.scheduleReconcile()
+  }
+
+  /** Snap the closed bars to the broker's, fill closed buckets the stream never
+   *  built, and correct the forming bar's volume through the builder. Returns
+   *  whether anything changed. */
+  private applyReconcile(fresh: Bar[]): boolean {
+    const bars = this.rawBars
+    if (bars.length === 0 || fresh.length === 0) return false
+    const forming = bars[bars.length - 1].time
+    const byTime = new Map(fresh.map((bar) => [bar.time, bar]))
+    let changed = false
+    for (let i = 0; i < bars.length; i++) {
+      const bar = bars[i]
+      if (bar.time >= forming) break
+      const truth = byTime.get(bar.time)
+      if (truth !== undefined && !sameBar(bar, truth)) {
+        bars[i] = truth
+        changed = true
+      }
+    }
+    // Closed buckets the client has nothing for: the socket dropped, the tab
+    // was hidden, the machine slept. Candles either side are fine, so the
+    // chart showed a clean hole. A bucket newer than the forming bar is filled
+    // only once the clock says it has closed; the one still open belongs to
+    // the stream, which is fresher than a poll.
+    const seconds = intervalSeconds(this.interval)
+    const now = nowSec()
+    const known = new Set(bars.map((bar) => bar.time))
+    const earliest = bars[0].time
+    const missing = fresh.filter((bar) => {
+      if (bar.time <= earliest || known.has(bar.time)) return false
+      if (bar.time < forming) return true
+      return seconds !== null && bar.time + seconds <= now
+    })
+    if (missing.length > 0) {
+      this.rawBars = [...bars, ...missing].sort((a, b) => a.time - b.time)
+      changed = true
+    }
+    // The forming bar keeps its OHLC from the ticks, which are fresher than a
+    // poll and must not jump backwards to it. Volume inside a bar only grows,
+    // so the higher reading is the later one, and it goes through the builder:
+    // the next tick folds into the builder's copy, and a volume patched into
+    // rawBars alone was written straight back over.
+    const current = this.rawBars[this.rawBars.length - 1]
+    const truth = byTime.get(forming)
+    if (truth !== undefined && current.time === forming) {
+      const volume = Math.max(truth.volume ?? 0, current.volume ?? 0)
+      if (volume !== (current.volume ?? 0)) {
+        const patched = { ...current, volume }
+        this.rawBars[this.rawBars.length - 1] = patched
+        this.live?.reseedForming(
+          {
+            symbol: this.symbolInfo.symbol,
+            exchange: this.symbolInfo.exchange,
+            interval: this.interval
+          },
+          patched
+        )
+        changed = true
+      }
+    }
+    return changed
+  }
+
   private async pageHistory(): Promise<void> {
     const chart = this.chart
     const feed = this.feed
@@ -833,6 +1217,8 @@ export class ChartTerminal implements TerminalApi {
     try {
       const to = oldest - 1
       const range = historyRange(this.interval, to)
+      // Through the cache: an older page is closed bars only, which is the one
+      // kind of series the cache is right about.
       const older = await feed.getBars({
         symbol: this.symbolInfo.symbol,
         exchange: this.symbolInfo.exchange,
@@ -957,14 +1343,15 @@ export class ChartTerminal implements TerminalApi {
       visibleTo,
       lastPrice: this.lastPrice,
       indicators: this.listIndicators(),
-      theme: this.getTheme()
+      theme: this.getTheme(),
+      analystGroups: [...this.aiGroups.keys()]
     }
   }
 
   async apply(command: ChartCommand): Promise<void> {
     switch (command.op) {
       case "draw":
-        await this.applyGroup(command.group, command.shapes)
+        await this.applyGroup(command.group, command.shapes, command.append === true)
         return
       case "clear":
         this.clearGroup(command.group)
@@ -983,6 +1370,9 @@ export class ChartTerminal implements TerminalApi {
         return
       case "remove_indicator":
         this.removeIndicatorFor(command.instanceId, command.indicatorId)
+        return
+      case "update_indicator":
+        this.updateIndicatorFor(command.indicatorId, command.instanceId, command.settings)
         return
       case "focus":
         this.focus(command.from, command.to)
@@ -1009,6 +1399,14 @@ export class ChartTerminal implements TerminalApi {
   private focus(from: number, to: number): void {
     const chart = this.chart
     if (chart === null || this.shownBars.length === 0) return
+    if (this.container.clientWidth <= 0) {
+      // The engine's setVisibleLogicalRange returns before doing anything at
+      // width 0, so a focus applied to a hidden page was simply gone. Held
+      // until the next resize to a real width.
+      this.pendingFocus = { from, to }
+      return
+    }
+    this.pendingFocus = null
     const layer = chart.dataLayer
     let left = layer.timeToIndexFloat(Math.min(from, to))
     let right = layer.timeToIndexFloat(Math.max(from, to))
@@ -1028,27 +1426,58 @@ export class ChartTerminal implements TerminalApi {
     chart.setAutoScale(true)
   }
 
+  private onResize(payload: unknown): void {
+    const pending = this.pendingFocus
+    if (pending === null) return
+    const width = (payload as { width?: unknown }).width
+    if (typeof width !== "number" || width <= 0) return
+    this.pendingFocus = null
+    this.focus(pending.from, pending.to)
+  }
+
   /* analyst markup */
 
-  private async applyGroup(group: string, shapes: AnnotationShape[]): Promise<void> {
+  /** Put a group's markup on the chart. Replaces the group unless `append`,
+   *  which keeps what is there and adds to it. */
+  private async applyGroup(
+    group: string,
+    shapes: AnnotationShape[],
+    append: boolean
+  ): Promise<void> {
     const draw = await this.ensureDrawing()
     if (draw === null) return
+    const palette = tonePalette(this.getTheme())
     this.mutingDraw = true
     try {
-      this.removeGroup(draw, group)
-      const drawings = buildAnnotations(group, shapes, tonePalette(this.getTheme()), 0)
+      const before = append ? (this.aiGroups.get(group) ?? []) : []
+      if (!append) this.removeGroup(draw, group)
+      // An appended id continues the group's numbering, from whichever of two
+      // floors is higher. The highest id still on the chart keeps a new drawing
+      // off an existing one: add() does no duplicate check and would draw
+      // both under one id. The count a from-zero rebuild of the stored shapes
+      // yields keeps retintAiDrawings, which rebuilds every group from zero,
+      // naming the same drawings after a hand-deleted one has left a gap.
+      const first = append
+        ? Math.max(
+            nextGroupIndex(draw.toJSON().map((drawing) => drawing.id), group),
+            buildAnnotations(group, before, palette, 0).length
+          )
+        : 0
+      const drawings = buildAnnotations(group, shapes, palette, 0, first)
       for (const drawing of drawings) {
         try {
           // add(), not fromJSON: fromJSON replaces the whole model and wipes
           // undo, redo and selection, so applying the analyst's markup would
           // throw away the user's own history. One add per shape also means the
-          // markup can be undone shape by shape.
+          // markup can be undone shape by shape. Each add is an undo entry, and
+          // so is each remove above; UNDO_DEPTH is sized for that.
           draw.add(drawing)
         } catch (error) {
           this.cb.onToast(describe(error), "error")
         }
       }
-      this.aiGroups.set(group, [...shapes])
+      this.aiGroups.set(group, [...before, ...shapes])
+      this.storeAiGroups()
     } finally {
       this.mutingDraw = false
     }
@@ -1082,19 +1511,28 @@ export class ChartTerminal implements TerminalApi {
   }
 
   private clearGroup(group?: string): void {
+    const mine = (id: string): boolean =>
+      group === undefined ? isAiDrawing(id) : inGroup(id, group)
     const draw = this.draw
-    if (draw === null) return
-    this.mutingDraw = true
-    try {
-      for (const drawing of draw.toJSON()) {
-        const mine = group === undefined ? isAiDrawing(drawing.id) : inGroup(drawing.id, group)
-        if (mine) draw.remove(drawing.id)
+    if (draw === null) {
+      // No controller yet (the tier is still loading, or a rebuild is between
+      // charts): the snapshot it will be restored from is edited instead, so
+      // the markup does not come back with the controller.
+      this.drawJson = this.drawJson.filter((drawing) => !mine(drawing.id))
+      this.store("draw", JSON.stringify(this.drawJson))
+    } else {
+      this.mutingDraw = true
+      try {
+        for (const drawing of draw.toJSON()) {
+          if (mine(drawing.id)) draw.remove(drawing.id)
+        }
+      } finally {
+        this.mutingDraw = false
       }
-    } finally {
-      this.mutingDraw = false
     }
     if (group === undefined) this.aiGroups.clear()
     else this.aiGroups.delete(group)
+    this.storeAiGroups()
     this.afterDrawChange()
   }
 
@@ -1103,7 +1541,8 @@ export class ChartTerminal implements TerminalApi {
    *  DrawingStyle stores a literal colour string, so nothing re-tints itself: a
    *  theme swap leaves AI markup on the old palette until it is written again.
    *  The ids are deterministic, so the shapes are rebuilt against the new
-   *  palette and only the style is pushed across, which merges.
+   *  palette and only the style is pushed across, which merges. Every update
+   *  is an undo entry; unchanged colours are skipped so a swap back costs none.
    */
   private retintAiDrawings(): void {
     const draw = this.draw
@@ -1139,13 +1578,12 @@ export class ChartTerminal implements TerminalApi {
 
   async setSymbol(symbol: string, exchange: string): Promise<void> {
     if (symbol === "" || exchange === "") return
-    if (symbol === this.symbolInfo.symbol && exchange === this.symbolInfo.exchange) return
-    this.teardownLive()
-    this.prevClose = null
-    this.lastPrice = null
-    await this.loadSymbolInfo(symbol, exchange)
-    if (this.destroyed) return
-    await this.reload()
+    if (symbol === this.target.symbol && exchange === this.target.exchange) return
+    this.target = { symbol, exchange }
+    // Analyst geometry belongs to one instrument and one timeframe. A RELIANCE
+    // envelope has no meaning on SBIN.
+    this.clearGroup(undefined)
+    await this.enqueue((gen) => this.loadView(gen, true), true)
   }
 
   async setInterval(interval: string): Promise<void> {
@@ -1165,9 +1603,11 @@ export class ChartTerminal implements TerminalApi {
     }
     this.interval = interval
     this.store("interval", interval)
+    // As for a symbol change: anchors computed on 5m bars say nothing on daily.
+    this.clearGroup(undefined)
     this.buildLegend()
     this.cb.onViewChanged({ interval: this.interval, chartType: this.chartTypeId })
-    await this.reload()
+    await this.enqueue((gen) => this.loadView(gen, false), true)
   }
 
   async setChartType(chartType: string): Promise<void> {
@@ -1176,14 +1616,18 @@ export class ChartTerminal implements TerminalApi {
       this.cb.onToast(`there is no chart type called "${chartType}"`, "error")
       return
     }
-    if (def.transform !== undefined && (await this.ensureTransformTier()) === null) return
-    if (this.destroyed) return
-    this.chartTypeId = def.value
-    this.store("charttype", def.value)
-    this.cb.onViewChanged({ interval: this.interval, chartType: this.chartTypeId })
-    // A series cannot change type in place, so this is the one action that
-    // rebuilds. build() snapshots the drawings and re-applies everything else.
-    this.build()
+    // Serialised behind any load in flight, never superseded by one: the
+    // rebuild reads whatever bars are loaded when its turn comes.
+    await this.enqueue(async () => {
+      if (def.transform !== undefined && (await this.ensureTransformTier()) === null) return
+      if (this.destroyed) return
+      this.chartTypeId = def.value
+      this.store("charttype", def.value)
+      this.cb.onViewChanged({ interval: this.interval, chartType: this.chartTypeId })
+      // A series cannot change type in place, so this is the one action that
+      // rebuilds. build() snapshots the drawings and re-applies everything else.
+      this.build(true)
+    }, false)
   }
 
   chartTypes(): ChartTypeOption[] {
@@ -1233,27 +1677,40 @@ export class ChartTerminal implements TerminalApi {
     this.cb.onIndicators(this.listIndicators())
   }
 
-  private async reapplyIndicators(): Promise<void> {
+  private async reapplyIndicators(gen: number): Promise<void> {
     if (this.tracked.length === 0) return
     if (!(await this.ensureIndicatorTier())) return
     const chart = this.chart
-    if (chart === null || this.destroyed) return
+    if (chart === null || this.destroyed || gen !== this.buildGen) return
     // Re-adding walks the tracked list, so a sync mid-loop would read a
     // half-applied chart and truncate it.
     this.applyingIndicators = true
+    const failed: string[] = []
     try {
       for (const record of this.tracked) {
-        if (!hasIndicator(record.indicatorId)) continue
+        if (!hasIndicator(record.indicatorId)) {
+          failed.push(record.indicatorId)
+          continue
+        }
         try {
           chart.addIndicator(record.indicatorId, record.settings)
         } catch {
           // One indicator that will not rebuild must not cost the others.
+          failed.push(record.indicatorId)
         }
       }
     } finally {
       this.applyingIndicators = false
     }
-    this.syncIndicators()
+    if (failed.length === 0) {
+      this.syncIndicators()
+      return
+    }
+    // The failed ones stay tracked: a sync here would rebuild the list from
+    // the chart and persist the layout without them, and the user's saved
+    // indicator would be silently gone on the next visit.
+    this.cb.onToast(`could not restore ${failed.join(", ")}`, "error")
+    this.cb.onIndicators(this.listIndicators())
   }
 
   async indicatorCatalogue(): Promise<IndicatorOption[]> {
@@ -1287,8 +1744,30 @@ export class ChartTerminal implements TerminalApi {
   removeIndicator(instanceId: string): void {
     const chart = this.chart
     if (chart === null) return
+    // A pane emptied by this removal is dropped by the engine, which emits
+    // paneRemoved; the drawing layers are re-homed from that event.
     chart.removeIndicator(instanceId)
     this.syncIndicators()
+  }
+
+  /** The chart dropped a pane and renumbered the ones below it.
+   *
+   *  The drawing controller keys its layers by pane index, so its layer for the
+   *  dropped pane is now attached to nothing and every later layer is one pane
+   *  off. The controller is rebuilt from its own JSON with the indices moved
+   *  down; a drawing that lived on the dropped pane has no pane left and goes
+   *  with it. fromJSON resets undo and redo, which is the cost of the rebuild.
+   */
+  private rehomeDrawings(removed: number): void {
+    if (this.destroyed || removed <= 0) return
+    this.detachDrawing()
+    this.drawJson = this.drawJson
+      .filter((drawing) => drawing.paneIndex !== removed)
+      .map((drawing) =>
+        drawing.paneIndex > removed ? { ...drawing, paneIndex: drawing.paneIndex - 1 } : drawing
+      )
+    this.store("draw", JSON.stringify(this.drawJson))
+    void this.ensureDrawing()
   }
 
   private removeIndicatorFor(instanceId?: string, indicatorId?: string): void {
@@ -1304,6 +1783,34 @@ export class ChartTerminal implements TerminalApi {
     const matches = chart.indicators().filter((one) => one.indicatorId === indicatorId)
     const last = matches[matches.length - 1]
     if (last !== undefined) this.removeIndicator(last.id)
+  }
+
+  /** The analyst restyling an indicator that is already on the chart. */
+  private updateIndicatorFor(
+    indicatorId: string,
+    instanceId: string | undefined,
+    settings: Record<string, unknown>
+  ): void {
+    const chart = this.chart
+    if (chart === null) return
+    const instances = chart.indicators()
+    // The named instance first. A stale id (the analyst read it a turn ago
+    // and the user has since re-added the study) falls through to the first
+    // instance of the study, which is the one "shade the bollinger" means.
+    const named =
+      instanceId === undefined ? undefined : instances.find((one) => one.id === instanceId)
+    const instance = named ?? instances.find((one) => one.indicatorId === indicatorId)
+    if (instance === undefined) {
+      this.cb.onToast(`${indicatorId} is not on the chart`, "error")
+      return
+    }
+    try {
+      // setSettings merges the patch and recomputes; it validates nothing, so
+      // the catch is for a value the indicator's own maths rejects.
+      this.applyIndicatorSettings(instance.id, settings)
+    } catch (error) {
+      this.cb.onToast(describe(error), "error")
+    }
   }
 
   async openIndicatorSettings(instanceId: string): Promise<void> {
@@ -1349,6 +1856,8 @@ export class ChartTerminal implements TerminalApi {
   private detachDrawing(): void {
     const draw = this.draw
     if (draw === null) return
+    for (const off of this.drawOff) off()
+    this.drawOff.length = 0
     try {
       this.drawJson = draw.toJSON()
       draw.destroy()
@@ -1365,12 +1874,23 @@ export class ChartTerminal implements TerminalApi {
     if (tier === null || chart === null || this.destroyed) return null
     // A second caller may have attached while the tier was in flight.
     if (this.draw !== null) return this.draw
+    // The controller's constructor restores whatever the chart's own drawings
+    // slot holds BEFORE fromJSON below runs, and a controller re-attached to
+    // the same chart finds the previous controller's last sync there, pane
+    // indices included. Measured on a pane removal: the stale index conjured
+    // an empty pane before the remapped list could replace it. The slot is
+    // written first, so the constructor restores the list this class holds.
+    chart.setDrawingState(this.drawJson)
     const controller = new tier.DrawingController(chart, {
       magnet: this.magnet,
       stayInDrawingMode: false,
-      // Raised well above the default 50 so a thirty-shape analysis cannot push
-      // the user's own edits off the undo stack.
-      historyLimit: 200
+      // Analyst maintenance costs undo entries. Replacing a group is one remove
+      // and one add per shape, a theme retint is one update per shape whose
+      // colour changed, and 1.9.2 offers no batch API, so a full fix (one entry
+      // per analyst operation) is not available. The depth absorbs it instead:
+      // at the default 50, one thirty-shape analysis evicted the user's own
+      // edits and Ctrl+Z after a theme swap reverted an analyst colour.
+      historyLimit: UNDO_DEPTH
     })
     this.draw = controller
     if (this.drawJson.length > 0) {
@@ -1390,9 +1910,9 @@ export class ChartTerminal implements TerminalApi {
       }
     }
     for (const name of ["draw:tool", "draw:add", "draw:update", "draw:remove", "draw:select"]) {
-      this.chartOff.push(chart.on(name, () => this.afterDrawChange()))
+      this.drawOff.push(chart.on(name, () => this.afterDrawChange()))
     }
-    this.chartOff.push(
+    this.drawOff.push(
       chart.on("draw:add", (payload) => {
         const drawing = (payload as { drawing?: Drawing }).drawing
         if (drawing === undefined || isAiDrawing(drawing.id)) return
@@ -1423,6 +1943,12 @@ export class ChartTerminal implements TerminalApi {
     }
   }
 
+  private aiCount(): number {
+    let count = 0
+    for (const drawing of this.drawJson) if (isAiDrawing(drawing.id)) count += 1
+    return count
+  }
+
   private afterDrawChange(): void {
     const draw = this.draw
     if (draw === null || this.mutingDraw) return
@@ -1434,7 +1960,8 @@ export class ChartTerminal implements TerminalApi {
       canUndo: draw.canUndo(),
       canRedo: draw.canRedo(),
       magnet: this.magnet,
-      count: this.drawJson.length
+      count: this.drawJson.length,
+      aiCount: this.aiCount()
     })
     this.cb.onDrawSelection(this.drawSelection(draw))
   }
@@ -1531,6 +2058,20 @@ export class ChartTerminal implements TerminalApi {
     this.magnet = on
     this.draw?.setOptions({ magnet: on })
     this.store("magnet", on ? "1" : "0")
+    if (this.draw === null) {
+      // The rail can toggle this before the controller exists (the tier is
+      // still loading on a fresh page) and afterDrawChange reports nothing
+      // without one, so the rail's own state is reported from here.
+      this.cb.onDrawState({
+        activeTool: this.drawTool,
+        canUndo: false,
+        canRedo: false,
+        magnet: on,
+        count: this.drawJson.length,
+        aiCount: this.aiCount()
+      })
+      return
+    }
     this.afterDrawChange()
   }
 

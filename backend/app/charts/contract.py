@@ -183,6 +183,13 @@ class ChartContext(BaseModel):
     ``visible_from`` and ``visible_to`` matter more than they look: "draw the
     visible highs and lows" is clipped to the viewport, so it has to travel with
     the request rather than being inferred from the loaded range.
+
+    ``analyst_groups`` is the list of analyst drawing groups currently on the
+    chart, sent as ``analystGroups``. The user can clear the analyst's markup
+    from the toolbar without any tool being called, so the backend's own store
+    of what it drew is not the truth about what is on screen. When the field is
+    present, a stored pattern whose group is not in it is treated as gone. It
+    is optional so a frontend that does not send it yet keeps working.
     """
 
     symbol: str = ""
@@ -197,6 +204,7 @@ class ChartContext(BaseModel):
     last_price: float | None = Field(default=None, alias="lastPrice")
     indicators: list[ChartIndicator] = Field(default_factory=list)
     theme: Literal["dark", "light"] = "dark"
+    analyst_groups: list[str] | None = Field(default=None, alias="analystGroups")
 
     model_config = {"populate_by_name": True}
 

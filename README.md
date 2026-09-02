@@ -77,11 +77,19 @@ instruments, and it looks option symbols up rather than guessing them.
 `/charts` is a charting terminal with an analyst beside it. Ask in plain words and it works on the
 chart in front of you.
 
+<p align="center">
+  <img src="docs/charts-analyst.jpg" alt="The /charts page: RELIANCE 5-minute candles with Bollinger Bands shaded light yellow, added by typing bollinger 20,2 fill light yellow, and the analyst panel naming the resolved colour" width="920" />
+</p>
+
+That chart came from one line of typing. The analyst read the symbol and the timeframe off the
+screen, resolved "light yellow" to a colour the engine can paint, and said which one it used.
+
 **It already knows what you are looking at.** The symbol, exchange, interval and visible range
 travel with every question, so there is nothing to repeat.
 
 - Draw the channel connecting the visible highs and lows
 - Add supertrend 3,10
+- Bollinger 20,2 fill light yellow
 - What is the trend and momentum
 - Mark the support and resistance
 - Switch to the 15 minute
@@ -113,6 +121,12 @@ behind the approval gate.
 The chart is [openalgo-charts](https://www.npmjs.com/package/openalgo-charts): 102 indicators, 51
 drawing tools and 13 chart types, all of which you can drive by hand as well as by prompt. Live
 candles arrive over a websocket.
+
+**Colours are words.** Every colour setting on every indicator takes a name (`yellow`, `crimson`,
+`light blue`) or a hex value, and a name the engine cannot paint is refused with the list of ones
+it knows rather than passed through to paint nothing. "Fill" and "shade" reach whichever setting
+that indicator actually shades with. One indicator needed help: the library's own Bollinger Bands
+declares no fill at all, unlike every other band indicator, so this app registers one that does.
 
 Your OpenAlgo API key never reaches the browser. History and ticks both come through the backend,
 which injects the key server-side and strips any the page tries to send.
@@ -294,6 +308,9 @@ python backend/tests/test_hitl_models.py    # the approval gate on every model
 python backend/tests/test_geometry.py       # swing pivots, channels, levels
 python backend/tests/test_tools_charts.py   # the chart tools, none of them gated
 python backend/tests/test_openalgo_proxy.py # the candle proxy and the tick relay
+python backend/tests/test_chart_wiring.py   # chart context, tool scoping, off-loop broker calls
+python backend/tests/test_colours.py        # the colour vocabulary
+python backend/tests/test_catalogue.py      # the generated indicator catalogue
 ```
 
 The order tests refuse to run unless OpenAlgo reports analyzer mode, so they never place a real

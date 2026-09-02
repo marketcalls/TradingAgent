@@ -35,7 +35,8 @@ const CHART_TOOL_LABELS: Record<string, string> = {
   find_support_resistance: "Clustering support and resistance",
   find_trendlines: "Fitting the trendlines",
   detect_patterns: "Looking for patterns",
-  project_target: "Projecting a target",
+  project_targets: "Projecting the targets",
+  describe_chart: "Describing the chart",
   analyse_trend: "Reading the trend",
   analyze_trend: "Reading the trend",
   analyse_momentum: "Reading momentum",
@@ -94,7 +95,9 @@ export default function StatusLine({ message, running, seconds }: StatusLineProp
     )
   }
 
-  if (seconds === null) return null
+  // A run that ended with no content has a measurement but nothing it led to;
+  // "Thought for 4s" above an empty answer reads as a claim that was not kept.
+  if (seconds === null || !message.content) return null
 
   return <div className="mb-2 text-xs text-muted-foreground">Thought for {seconds}s</div>
 }

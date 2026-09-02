@@ -13,10 +13,9 @@
  *   - Tool cards do not survive a reload: transcripts are text only.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
 import Sidebar, { type Route } from "./components/Sidebar"
 import { cn } from "./lib/format"
-import ChartsPage from "./pages/ChartsPage"
 import ModeBanner from "./components/ModeBanner"
 import ThinkingSelector from "./components/ThinkingSelector"
 import Message from "./components/Message"
@@ -40,6 +39,12 @@ import {
   type ConfirmState,
   type StreamEvent
 } from "./lib/sse"
+
+/** Split out of the main bundle: the chart engine and its tiers are the largest
+ *  thing in the app, and the chat page must not pay for them up front. The
+ *  chunk is fetched on the first visit to /charts, which is also when the page
+ *  is first mounted, so the split adds no second latch. */
+const ChartsPage = lazy(() => import("./pages/ChartsPage"))
 
 const THEME_KEY = "oa-theme"
 
@@ -423,10 +428,20 @@ export default function App() {
           element, where the container measures 0x0 and the engine has nothing to
           size itself against. And a user who never opens Charts should not pay
           for a websocket they are not watching. Latching on first visit satisfies
-          all three: it is built once, while visible, and then only hidden. */}
+          all three: it is built once, while visible, and then only hidden. The
+          page is told when it is hidden, because a window listener cannot tell
+          display:none from visible and its shortcuts were firing from chat. */}
       {chartsMounted ? (
         <div className={cn("min-w-0 flex-1", route === "charts" ? "flex" : "hidden")}>
-          <ChartsPage onNavigate={navigate} />
+          <Suspense
+            fallback={
+              <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+                <span className="shimmer">Loading the chart</span>
+              </div>
+            }
+          >
+            <ChartsPage onNavigate={navigate} active={route === "charts"} />
+          </Suspense>
         </div>
       ) : null}
 

@@ -15,11 +15,18 @@
  * The user bubble carries data-user-msg because the panel pins the newest
  * question to the top by querying for it, the same trick App.tsx uses.
  *
- * A confirmation can never legitimately arrive here: /charts holds no tool that
- * mutates broker state. If one does, the run is paused on the server with no card
- * to resolve it, so the turn says so plainly rather than looking merely idle.
+ * Memoised, because the markdown parse is the expensive part of this column and
+ * the panel re-renders on every token. Only the turn whose message object
+ * changed re-parses; the rest keep their props and are skipped. That holds only
+ * while every prop is referentially stable between renders, which the panel
+ * guarantees by handing older turns one shared empty chip list.
+ *
+ * A confirmation never renders here. The hook cancels the run the moment a
+ * confirm frame arrives and reports it through `error`, so there is no card and
+ * no notice to draw.
  */
 
+import { memo } from "react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import type { ChatMessage } from "../../lib/sse"
@@ -37,13 +44,7 @@ interface AnalystMessageProps {
   onChip: (chip: ActionChip) => void
 }
 
-export default function AnalystMessage({
-  message,
-  running,
-  seconds,
-  chips,
-  onChip
-}: AnalystMessageProps) {
+function AnalystMessage({ message, running, seconds, chips, onChip }: AnalystMessageProps) {
   if (message.role === "user") {
     return (
       <div className="mb-4 flex justify-end" data-user-msg>
@@ -73,13 +74,6 @@ export default function AnalystMessage({
         </div>
       ))}
 
-      {message.confirm && !message.confirm.resolved ? (
-        <div className="mt-2 rounded-lg border border-warn-border bg-warn-soft px-2.5 py-1.5 text-xs text-warn">
-          This asked for an approval, and nothing on the charts page can approve one. Open the chat
-          page to act on it.
-        </div>
-      ) : null}
-
       {message.error ? (
         <div className="mt-2 rounded-lg border border-danger-border px-2.5 py-1.5 text-xs text-danger">
           {message.error}
@@ -90,3 +84,5 @@ export default function AnalystMessage({
     </div>
   )
 }
+
+export default memo(AnalystMessage)

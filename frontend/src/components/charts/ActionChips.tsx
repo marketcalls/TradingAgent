@@ -15,6 +15,15 @@
  * what the finished turn actually did, which is visible in its tool calls. That
  * is a narrower signal than a server-authored suggestion, and deliberately so: a
  * chip only appears for something the turn demonstrably performed.
+ *
+ * The tool names are exact sets, not patterns. A pattern that read "indicator"
+ * matched list_chart_indicators, one that read "draw" matched clear_annotations,
+ * and a chip offering to project a target from markup that had just been
+ * cleared is worse than no chip. A new tool earns its chip by being named here.
+ *
+ * "Drew" additionally needs the page to have seen a draw frame that turn.
+ * draw_envelope answers ok when it finds nothing to fit, so the tool result is
+ * not proof that anything is on the canvas; the frame is.
  */
 
 import type { ChatMessage } from "../../lib/sse"
@@ -27,28 +36,42 @@ export type ActionChip =
    *  Sidebar's Route so a chip cannot point at a surface that does not exist. */
   | { kind: "navigate"; label: string; target: Route }
 
-/** Tool names that put markup on the canvas. Matched loosely because the tool
- *  set is still growing and a new drawing tool must not silently lose its chip. */
-const DREW = /(draw|annotat|envelope|channel|trendline|level|fib|zone|marker|callout)/i
-const INDICATOR = /indicator|supertrend|overlay/i
-/** Language that only the chat page can act on, since nothing here places orders. */
-const EXECUTION = /\b(buy|sell|entry|entries|order|stop loss|stoploss|position|square off)\b/i
+/** Tools that put markup on the canvas. Exact names, see the header. */
+const DREW = new Set([
+  "draw_envelope",
+  "draw_trendline",
+  "draw_levels",
+  "draw_zone",
+  "project_targets"
+])
+/** The one tool that adds a study. Listing and removing are not adding. */
+const ADDED_INDICATOR = new Set(["add_chart_indicator"])
+/** Order language only, which is what the chat page exists for. "position" is
+ *  deliberately absent: it is ordinary analyst prose ("price is in a position
+ *  to break out") far more often than it is an instruction. */
+const EXECUTION = /\b(buy|sell|entry|entries|stop[ -]?loss|square off)\b/i
 
-function ranTool(message: ChatMessage, pattern: RegExp): boolean {
-  return (message.tools ?? []).some((call) => call.ok !== false && pattern.test(call.name))
+function ranTool(message: ChatMessage, names: Set<string>): boolean {
+  return (message.tools ?? []).some((call) => call.ok !== false && names.has(call.name))
 }
 
 interface ChartFacts {
   symbol: string
   interval: string
+  /** True when the symbol or the view changed after this turn finished. The
+   *  chips that act on "the structure you just drew" are then about a chart
+   *  the user is no longer looking at, and are withheld. */
+  stale: boolean
 }
 
 /** Up to two follow-ups for one finished answer. Empty while a turn is running,
  *  or when the turn produced nothing to follow up on. */
 export function suggestChips(message: ChatMessage, chart: ChartFacts): ActionChip[] {
   if (message.role !== "assistant" || !message.content) return []
+  // An answer that never reached its conclusion has nothing to follow up on.
+  if (message.cutShort) return []
 
-  if (ranTool(message, DREW)) {
+  if (!chart.stale && message.drew === true && ranTool(message, DREW)) {
     return [
       {
         kind: "prompt",
@@ -59,7 +82,7 @@ export function suggestChips(message: ChatMessage, chart: ChartFacts): ActionChi
     ]
   }
 
-  if (ranTool(message, INDICATOR)) {
+  if (ranTool(message, ADDED_INDICATOR)) {
     return [
       {
         kind: "prompt",
@@ -74,6 +97,8 @@ export function suggestChips(message: ChatMessage, chart: ChartFacts): ActionChi
     ]
   }
 
+  // Tested last: the tool-derived chips above are proof of an action, and this
+  // one is only a reading of the prose.
   if (EXECUTION.test(message.content)) {
     return [
       {

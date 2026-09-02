@@ -151,6 +151,14 @@ export interface ChatMessage {
   confirm?: ConfirmState
   /** Server-side corrections about this turn, shown under the answer. */
   notices?: { level: string; message: string }[]
+  /** Set when a chart_command frame carrying a non-empty "draw" op arrived during
+   *  this turn. A tool result cannot say this: draw_envelope answers ok even when
+   *  it found nothing to fit, so the frame is the only proof markup landed. */
+  drew?: boolean
+  /** Set when the run ended without finishing the answer (the model hit its
+   *  length limit, or the run was cancelled). Follow-ups are not offered on a
+   *  turn that never reached its conclusion. */
+  cutShort?: boolean
 }
 
 export interface ChatStreamBody {

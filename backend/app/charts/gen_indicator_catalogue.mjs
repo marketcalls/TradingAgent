@@ -16,6 +16,20 @@
  * point is declared sideEffects in the package manifest and its module body calls
  * registerIndicator for every built-in. Importing only the core entry yields an empty
  * list, which is the one failure mode worth naming here.
+ *
+ * Beside `inputs`, each entry carries what the chart can style but the descriptor
+ * does not list as an input:
+ *   - style_inputs: the per-plot appearance keys indicatorStyleInputs derives
+ *     (upper:opacity, upper:width, upper:lineStyle, upper:type, ...) plus the colour
+ *     keys those plots read. One entry per key: the generator repeats a shared colour
+ *     key once per plot that uses it (bollinger's bandColor appears under both BB
+ *     Upper and BB Lower), and a settings dict has one slot per key.
+ *   - fill: {has, color_key, opacity} summarising the descriptor's first fills[] entry,
+ *     so the tool knows which indicators shade and which key colours the shading.
+ *   - fills: every fills[] entry, for the few that declare more than one (vwap's three
+ *     bands, supertrend's two, cci's level band and its own bollinger).
+ *
+ * The bollinger override below is applied BEFORE the dump. See its comment.
  */
 
 import { writeFileSync, mkdirSync } from "node:fs";
@@ -63,10 +77,88 @@ if (typeof core.registeredIndicators !== "function") {
   process.exit(1);
 }
 
-const descriptors = core.registeredIndicators();
-if (!descriptors.length) {
+if (!core.registeredIndicators().length) {
   console.error("registry is empty: the indicators side-effect entry did not load");
   process.exit(1);
+}
+
+/**
+ * The bollinger override.
+ *
+ * openalgo-charts 1.9.2 registers bollinger with NO fills, while every other band
+ * indicator (envelope, donchian, keltner-channel, ma-channel, standard-error-bands)
+ * declares fills [{between: ["upper", "lower"], colorUpKey: "fillColor",
+ * colorDownKey: "fillColor", opacity: 0.05}] and a fillColor input. The browser
+ * patches the built-in over the same id in
+ * frontend/src/lib/charts/indicatorOverrides.ts, and this script applies the same
+ * patch before dumping so the catalogue advertises what the chart will accept.
+ *
+ * The constants below are read out of both files by name and compared by
+ * backend/tests/test_catalogue.py: change one side and the test fails.
+ */
+const BOLLINGER_ID = "bollinger";
+const BOLLINGER_FILL_KEY = "fillColor";
+const BOLLINGER_FILL_LABEL = "Fill";
+const BOLLINGER_FILL_OPACITY = 0.08;
+const BOLLINGER_FILL_BETWEEN = ["upper", "lower"];
+const BOLLINGER_BAND_KEY = "bandColor";
+const BOLLINGER_BAND_FALLBACK = "#4f8cff";
+
+function applyIndicatorOverrides() {
+  if (!core.hasIndicator(BOLLINGER_ID)) return;
+  const builtin = core.getIndicator(BOLLINGER_ID);
+  const hasInput = builtin.inputs.some((i) => i.key === BOLLINGER_FILL_KEY);
+  if (hasInput && (builtin.fills || []).length) return;
+  const band = builtin.inputs.find((i) => i.key === BOLLINGER_BAND_KEY);
+  const fillDefault = band && band.type === "color" ? band.default : BOLLINGER_BAND_FALLBACK;
+  // registerIndicator over an existing id replaces the entry in place: the registry
+  // stays at 102 and getIndicator returns this descriptor.
+  core.registerIndicator({
+    ...builtin,
+    inputs: [
+      ...builtin.inputs,
+      { key: BOLLINGER_FILL_KEY, type: "color", label: BOLLINGER_FILL_LABEL, default: fillDefault },
+    ],
+    fills: [
+      {
+        between: BOLLINGER_FILL_BETWEEN,
+        colorUpKey: BOLLINGER_FILL_KEY,
+        colorDownKey: BOLLINGER_FILL_KEY,
+        opacity: BOLLINGER_FILL_OPACITY,
+      },
+    ],
+  });
+}
+
+applyIndicatorOverrides();
+
+const descriptors = core.registeredIndicators();
+
+function styleInputs(d) {
+  if (typeof core.indicatorStyleInputs !== "function") return [];
+  const byKey = new Map();
+  for (const input of core.indicatorStyleInputs(d)) {
+    if (!byKey.has(input.key)) byKey.set(input.key, cleanInput(input));
+  }
+  return [...byKey.values()];
+}
+
+function fillEntries(d) {
+  return (d.fills || []).map((f) => ({
+    between: [...f.between],
+    color_up_key: f.colorUpKey ?? null,
+    color_down_key: f.colorDownKey ?? null,
+    opacity: typeof f.opacity === "number" ? f.opacity : null,
+  }));
+}
+
+function fillSummary(fills) {
+  const first = fills[0];
+  return {
+    has: fills.length > 0,
+    color_key: first ? first.color_up_key : null,
+    opacity: first ? first.opacity : null,
+  };
 }
 
 const indicators = {};
@@ -75,6 +167,7 @@ for (const d of descriptors) {
   // can still report a full settings dict, but the numeric and boolean ones are what
   // a spoken request like "supertrend 3,10" can ever land on.
   const inputs = (d.inputs || []).map(cleanInput);
+  const fills = fillEntries(d);
   indicators[d.id] = {
     id: d.id,
     name: d.name,
@@ -85,6 +178,9 @@ for (const d of descriptors) {
     // inputs, which is the order the settings panel shows them in.
     numeric_keys: inputs.filter((i) => i.type === "number").map((i) => i.key),
     plots: (d.plots || []).map((p) => p.key || p.id).filter(Boolean),
+    style_inputs: styleInputs(d),
+    fill: fillSummary(fills),
+    fills,
   };
 }
 

@@ -227,13 +227,15 @@ export default function IndicatorPickerDialog({
               aria-controls="indicator-catalogue"
               aria-autocomplete="list"
               aria-activedescendant={flat.length > 0 ? `indicator-option-${cursor}` : undefined}
-              disabled={all.length === 0}
               value={query}
               onChange={(event) => setQuery(event.target.value)}
+              // Never disabled: the field takes focus on open, and a disabled
+              // field cannot. Typing before the catalogue lands is fine, the
+              // filter applies the moment it does.
               placeholder={
-                all.length === 0 ? "The catalogue has not loaded" : "Search by name, id or category"
+                all.length === 0 ? "The catalogue is loading" : "Search by name, id or category"
               }
-              className="w-full rounded-lg border border-input bg-background py-1.5 pl-8 pr-2.5 text-sm outline-none placeholder:text-muted-foreground focus:border-primary disabled:opacity-60"
+              className="w-full rounded-lg border border-input bg-background py-1.5 pl-8 pr-2.5 text-sm outline-none placeholder:text-muted-foreground focus:border-primary"
             />
           </div>
         </div>
@@ -251,8 +253,13 @@ export default function IndicatorPickerDialog({
             ) : (
               <ul ref={listRef} id="indicator-catalogue" role="listbox" aria-label="Indicator catalogue">
                 {groups.map((group) => (
-                  <li key={group.category} role="presentation">
-                    <div className="px-2 pb-1 pt-2 text-[11px] uppercase tracking-wide text-muted-foreground">
+                  // A listbox's children must be options or groups; the visible
+                  // header is decoration and the group label carries the text.
+                  <li key={group.category} role="group" aria-label={group.category}>
+                    <div
+                      aria-hidden="true"
+                      className="px-2 pb-1 pt-2 text-[11px] uppercase tracking-wide text-muted-foreground"
+                    >
                       {group.category}
                     </div>
                     <ul role="presentation">

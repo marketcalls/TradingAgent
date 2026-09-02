@@ -441,31 +441,49 @@ no undo pollution, no tier import.
 Pure Python over numpy and pandas, both already in `requirements.txt`.
 
 **Swing pivot detection is the whole foundation.** The primary output is not a
-fitted line, it is an ordered list of real pivots, which the frontend connects.
-Everything else is built on it.
+fitted line, it is an ordered list of real pivots. Everything else is built on
+it.
 
-- swing pivots over a lookback, with a significance filter so a noisy series
-  does not return sixty vertices
-- the envelope: highs left to right, lows right to left, one closed polyline
+- swing pivots over the visible window, with a significance ladder so a noisy
+  series does not return sixty vertices and a clean trend is not thinned to none
+- the channel: two straight rails, each through two real pivots of its own side
 - trendline through selected pivots, with touch validation
 - horizontal support and resistance by pivot price clustering
-- converging trendlines for triangles and wedges
-- measured-move projection from envelope width
+- measured-move projection from the channel's width at the right edge
 
 Each returns exact anchors. The model never computes a coordinate.
 
+**The channel is two lines, decided with the user after two wrong guesses.** The
+first build drew a polyline through every pivot, which kinked back on itself and
+read as a blob. The second fitted each rail to its own side and then projected
+both across the union of both sides' time span, which put a support line fifty
+rupees above the candles. Three rules replaced that, and each one was paid for:
+
+1. A rail starts at its first anchor pivot and runs right. It never runs
+   backwards past the evidence.
+2. A rail must bound price. The pair of pivots is chosen for the fewest bars
+   crossing the line over its span, so a candle poking through a rail is the
+   exception the reply names, not the default.
+3. The same chart draws the same lines. Selection is a strict tuple order with
+   no ties left to chance, and the forming bar is excluded from every step that
+   feeds it, because a channel that changed shape on every tick reads as broken.
+
+Rule 3 was claimed before it was true. Excluding the forming bar from the
+crossing count while leaving it in the window range that sets the pivot
+threshold still redrew the rails on 8 percent of tick perturbations across 400
+probes. The fix is to exclude it everywhere, and the proof is a probe over many
+frames, not one lucky test.
+
 **"Visible" is part of the request.** The reference prompt says "the price move
-from 4446 to 3235", and the drawn envelope spans exactly the pivots on screen.
-So the visible logical range is part of the ambient context in 4.1, and pivot
+from 4446 to 3235", and the drawn channel spans the pivots on screen. So the
+visible logical range is part of the ambient context in 4.1, and pivot
 selection is clipped to it. A drawing is not re-derived on pan: once placed it
 is an object the user owns, and silently redrawing it under them would be worse
 than leaving it where they saw it.
 
-**Density control matters more than fit quality.** A pivot detector with too
-short a lookback produces a sawtooth that reads as noise, not structure. The
-tunable is the significance filter, and it wants a default that produces roughly
-the five to nine vertices per boundary visible in the reference, not a vertex
-per swing.
+**Density control matters more than fit quality.** The channel fit works on the
+five most significant pivots per side. More than that fits noise; the polyline
+that was rejected used nine.
 
 **The pivot off-by-one to avoid.** `pivotHigh` returns the pivot price on the
 *confirming* bar, carrying the value from `right` bars earlier. OpenAlgo's own
@@ -593,18 +611,31 @@ deliberate: the chart has to be good on its own before an agent drives it.
 
 ---
 
-## Part 7. Open questions
+## Part 7. Decisions taken, and what is still open
 
-1. Live tick transport, Part 3.1. Needs deciding before step 7.
-2. Whether the chat page and /charts share one session or hold separate
-   conversations. Separate is simpler and probably right, but it means
-   extracting the send and event-handling block into a reusable hook.
-3. Whether v1 ships pattern detection beyond the pivot envelope, trendlines and
-   support and resistance. The named patterns (head and shoulders, double tops,
-   flags) are more code and less reliable, and all of them sit on the same pivot
-   list, so they are additive rather than a rewrite.
-4. The pivot significance default. It decides whether the envelope reads as
-   structure or as noise, and it is the one number a user will want to tune.
+Decided, with the reason:
+
+1. Live ticks go through a WebSocket relay in FastAPI (option 1 in 3.1). The key
+   stays server-side and the relay refuses the account order stream outright.
+   The relay must also check the Origin header: CORS does not apply to WebSocket
+   upgrades, so without that gate any page the user has open could read the feed.
+2. The chat page and /charts hold separate conversations, through one shared
+   hook that owns the transport. Both stay mounted; the inactive one is hidden.
+3. Tradeable instruments subscribe in Quote mode, not Depth. Depth carries no
+   traded quantity, so every live bar after page load had zero volume. Indices
+   have no book and stay on LTP. One mode per symbol, never two.
+4. A chart turn registers no order tool at all. The page must be read-only at
+   the tool layer, which is the layer that holds, not only in the prompt.
+
+Still open:
+
+5. Named patterns (head and shoulders, double tops, flags). All of them sit on
+   the same pivot list, so they are additive rather than a rewrite, and none is
+   in v1.
+6. "Analyse this screen" sends no screenshot yet. The terminal can capture one;
+   nothing calls it.
+7. A REST quote-polling fallback when the socket is down. The socket is the only
+   tick source today.
 
 ## Part 8. Unrelated defect found while surveying
 

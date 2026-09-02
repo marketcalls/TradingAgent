@@ -27,7 +27,9 @@ import type { DrawSelection } from "../../lib/charts/terminal-api"
 import { cn, labelize } from "../../lib/format"
 import { drawToolIcon, lineStyleIcon } from "./chartIcons"
 
-const WIDTHS = [1, 2, 3, 4]
+/** 1.5 is the engine's default line width. Without it a fresh drawing matched
+ *  no segment and the control read as though nothing were selected. */
+const WIDTHS = [1, 1.5, 2, 3, 4]
 const LINE_STYLES = ["solid", "dashed", "dotted"]
 
 const SEGMENT_WRAPPER = "flex overflow-hidden rounded-lg border border-border"
@@ -152,7 +154,7 @@ export default function DrawingStyleBar({
         type="button"
         aria-pressed={locked}
         onClick={() => onUpdate({ locked: !locked })}
-        aria-label="Lock this drawing"
+        aria-label={locked ? "Unlock this drawing" : "Lock this drawing"}
         title={locked ? "Unlock this drawing" : "Lock this drawing"}
         className={cn(BAR_BUTTON, locked && "bg-muted text-foreground")}
       >

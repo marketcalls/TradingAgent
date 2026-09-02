@@ -39,12 +39,55 @@ instance with RELIANCE NSE:
     bars, the tuned default lands 5 to 9 vertices per boundary against 21 to 27
     raw fractals.
 
+  - THE FORMING BAR IS TRANSPARENT. The last bar of a frame is still trading.
+    It never becomes a pivot, it is left out of the window range that the
+    significance ladder is built on, it is left out of the snap pool, and it
+    is left out of the crossing count in :func:`fit_channel`. Before that rule
+    covered the range, a tick on the last bar changed the range, so the ladder
+    rung, so the fractal set the zigzag kept, so the ``max_points`` cut, so the
+    rails: measured on 40 synthetic frames (trend, range, triangle, noise) with
+    the last bar's high and low moved by 0.1, 0.5 and 1 percent, the pivot set
+    changed in 8 of 120 cases and the drawn rails in 6. With the rule, 0 of
+    120 for both. A bar CLOSING is different and is not suppressed: appending
+    one flat bar to the same 40 frames changed the pivot set in 4 (three times
+    the newly closed bar confirmed a fractal three bars back, once it became
+    the window's extreme) and the rails in 3 (once with the pivots unchanged,
+    because the closed bar's close is the new nearness reference and a
+    candidate pair crossed the bound). ``backend/tests/test_geometry.py``
+    classifies every such change by its cause and fails on any it cannot name.
+    That is information, and a channel that hid it would be wrong in the
+    other direction.
+
+  - EQUAL EXTREMES ARE PIVOTS. A double top that prints the same high twice is
+    two swing highs, because both sides of the fractal test accept equality.
+    A plateau of consecutive equal bars is one pivot, its first bar, and a
+    constant series is no pivot at all.
+
+  - RAILS ARE ALLOWED TO CROSS, AND SAY SO. A symmetrical triangle that has
+    resolved yields an upper rail that ends below the lower one. Nothing
+    forces them apart; :func:`fit_channel` reports ``shape`` "crossed" with a
+    zero width, and the caller must not narrate that as a channel or project
+    targets off it.
+
+  - THE MEASURED MOVE MEASURES THE DRAWN RAILS. :func:`measured_move` takes the
+    rails :func:`fit_channel` returned and evaluates them at the right edge
+    they were drawn to, so the breakout price the model narrates is the price
+    on screen to the last decimal. Fitting the stored pivots again put the
+    two a median 11 points and at worst 394 points apart on 200 synthetic
+    frames.
+
+  - AN INTEGER INDEX IS AN EPOCH. ``pd.DatetimeIndex`` reads bare integers as
+    nanoseconds; :func:`to_utc_seconds` reads them as seconds, or as
+    milliseconds when they exceed 1e11, and refuses a list that mixes
+    timezones rather than turning the minority zone into NaN.
+
 Input frames come from ``backend/app/openalgo/frames.py``: columns open, high,
 low, close, volume, oi, a DatetimeIndex named timestamp, sorted ascending, no
 duplicates, no NaN in OHLC. Nothing here raises on a degenerate frame. An empty
 frame, a flat series, a three bar series and a single pivot series all return
 empty or zeroed results, because a drawing tool that throws on a quiet chart is
-worse than one that draws nothing.
+worse than one that draws nothing. The one exception is deliberate: a
+mixed-timezone index raises, because the alternative is a silent data hole.
 """
 
 from __future__ import annotations
@@ -59,15 +102,19 @@ from numpy.lib.stride_tricks import sliding_window_view
 __all__ = [
     "Pivot",
     "to_utc_seconds",
+    "bar_interval_seconds",
     "swing_pivots",
     "envelope",
     "fit_trendline",
+    "fit_channel",
     "support_resistance",
     "measured_move",
     "snap_to_pivot",
     "DEFAULT_LEFT",
     "DEFAULT_RIGHT",
     "ENVELOPE_SIGNIFICANCE",
+    "TOUCH_TOLERANCE_PCT",
+    "CROSSING_TOLERANCE_PCT",
 ]
 
 #: Fractal half-widths. Three bars either side is the smallest window that
@@ -121,6 +168,37 @@ _MAX_TRENDLINE_PIVOTS = 40
 #: of its own height across its span before it is called a trend.
 _TREND_RATIO = 0.5
 
+#: Slack for a pivot to count as touching a rail, as a percentage of the rail's
+#: price at that bar. A remembered swing sits a few ticks off the line.
+TOUCH_TOLERANCE_PCT = 0.5
+
+#: Slack before a bar counts as crossing a rail. Tighter than the touch slack on
+#: purpose: at 0.5 percent a bar could sit 7 points beyond a rail on a 1400
+#: stock and still count as contained, which is not what "bounds price" means.
+#: Measured on the 300 frame coverage probe in ``fit_channel``'s docstring.
+CROSSING_TOLERANCE_PCT = 0.2
+
+#: How far from the last closed close a rail may end before it stops counting as
+#: near price: the smaller of :data:`_RAIL_REACH` times the window's closed-bar
+#: range and :data:`_RAIL_REACH_PCT` of the close. Two bounds because either one
+#: alone fails a real chart. Swept at 0.5, 0.75, 1.0 and 1.5 ranges over 300
+#: synthetic frames and the live RELIANCE D and 5m frames: half a range threw
+#: away a 121 bar clean support on the 5m frame (its range is 3.7 percent of
+#: price) for a 70 bar one, while one full range let a rising pair of two early
+#: highs end 320 points, 24 percent of price, above the close on the daily
+#: frame windowed to June 2026, because the window's range was the year's 362
+#: point fall. One range keeps the 5m support; 20 percent of price drops the
+#: daily runaway. On the synthetic frames the pair of bounds leaves 30 of 300
+#: channels below half coverage against 36 at half a range, 24 with no reach at
+#: all and 33 under the old ordering.
+_RAIL_REACH = 1.0
+_RAIL_REACH_PCT = 0.2
+
+#: An integer index is an epoch. Anything this large is milliseconds (1e11
+#: seconds is the year 5138; 1e11 milliseconds is March 1973), so the split
+#: cannot misread a real timestamp in either unit.
+_EPOCH_MS_THRESHOLD = 1e11
+
 Kind = Literal["high", "low"]
 
 
@@ -134,11 +212,14 @@ class Pivot:
         time: UTC seconds for that same bar.
         price: The extreme itself, the bar's high for a swing high and its low
             for a swing low.
+        kind: "high" or "low" when the detector knows which side the pivot
+            came from, otherwise "". Not part of the wire anchor.
     """
 
     index: int
     time: float
     price: float
+    kind: str = ""
 
     def as_anchor(self) -> dict[str, float]:
         """Render the pivot as a wire anchor.
@@ -159,7 +240,7 @@ class _Cand:
     kind: str
 
     def to_pivot(self) -> Pivot:
-        return Pivot(index=self.index, time=self.time, price=self.price)
+        return Pivot(index=self.index, time=self.time, price=self.price, kind=self.kind)
 
 
 def to_utc_seconds(index: Any) -> np.ndarray:
@@ -172,14 +253,25 @@ def to_utc_seconds(index: Any) -> np.ndarray:
     index is treated as already UTC, because the server derived it from an
     epoch rather than from a wall clock.
 
+    An integer index is read as an epoch, not as nanoseconds the way
+    ``pd.DatetimeIndex`` would read it: values above 1e11 are milliseconds and
+    values below are seconds. The split is safe in both directions, because
+    1e11 seconds is the year 5138 and 1e11 milliseconds is March 1973.
+
     Args:
         index: A ``pd.DatetimeIndex``, or anything ``pd.DatetimeIndex`` accepts,
-            such as a Series of timestamps or a list of ISO strings.
+            such as a Series of timestamps or a list of ISO strings, or an
+            integer index of epoch seconds or milliseconds.
 
     Returns:
         A float64 array of UTC seconds since the epoch, the same length as the
         input. NaT becomes NaN. An empty or unparseable input returns an empty
         array rather than raising.
+
+    Raises:
+        ValueError: When the input mixes timezones, for example one UTC and one
+            Asia/Kolkata timestamp in the same list. Coercing that would keep
+            one zone and turn the other into NaN, which is a silent data hole.
     """
     if index is None:
         return np.empty(0, dtype=float)
@@ -187,9 +279,17 @@ def to_utc_seconds(index: Any) -> np.ndarray:
     if isinstance(index, pd.DatetimeIndex):
         idx = index
     else:
+        integer = _integer_epoch(index)
+        if integer is not None:
+            return integer
         try:
             idx = pd.DatetimeIndex(index)
         except (TypeError, ValueError):
+            if _mixed_timezones(index):
+                raise ValueError(
+                    "to_utc_seconds: the index mixes timezones; convert every "
+                    "timestamp to one zone before normalising"
+                ) from None
             try:
                 idx = pd.DatetimeIndex(pd.to_datetime(index, errors="coerce"))
             except (TypeError, ValueError):
@@ -212,6 +312,75 @@ def to_utc_seconds(index: Any) -> np.ndarray:
     return seconds
 
 
+def _integer_epoch(index: Any) -> np.ndarray | None:
+    """UTC seconds for an integer index, or None when the index is not integer.
+
+    Anything at or above :data:`_EPOCH_MS_THRESHOLD` is milliseconds, anything
+    below is seconds. A pandas Index, a numpy array and a plain list of ints
+    all qualify; bools and floats do not.
+    """
+    if isinstance(index, (pd.Index, pd.Series, np.ndarray)):
+        dtype = getattr(index, "dtype", None)
+        if dtype is None or not pd.api.types.is_integer_dtype(dtype):
+            return None
+        raw = np.asarray(index, dtype="int64")
+    elif isinstance(index, (list, tuple)):
+        if not index or not all(
+            isinstance(v, (int, np.integer)) and not isinstance(v, (bool, np.bool_))
+            for v in index
+        ):
+            return None
+        raw = np.asarray(index, dtype="int64")
+    else:
+        return None
+    seconds = raw.astype(float)
+    ms = np.abs(seconds) >= _EPOCH_MS_THRESHOLD
+    if ms.any():
+        seconds = seconds.copy()
+        seconds[ms] = seconds[ms] / 1000.0
+    return seconds
+
+
+def _mixed_timezones(index: Any) -> bool:
+    """True when the elements of a list carry more than one timezone."""
+    try:
+        items = list(index)
+    except TypeError:
+        return False
+    zones: set[str] = set()
+    for item in items:
+        tz = getattr(item, "tzinfo", None)
+        zones.add("naive" if tz is None else str(tz))
+        if len(zones) > 1:
+            return True
+    return False
+
+
+def bar_interval_seconds(index: Any) -> float:
+    """The bar spacing of a frame in seconds, from the median timestamp gap.
+
+    The median rather than the mean, so weekends and holidays on a daily frame
+    and the overnight gap on an intraday one do not stretch the answer. A daily
+    frame reports 86400, a 5m frame 300.
+
+    Args:
+        index: The frame's index, or an array of UTC seconds.
+
+    Returns:
+        Seconds per bar, or 0.0 when there are fewer than two finite times.
+    """
+    times = index if isinstance(index, np.ndarray) else to_utc_seconds(index)
+    times = np.asarray(times, dtype=float)
+    times = times[np.isfinite(times)]
+    if times.size < 2:
+        return 0.0
+    gaps = np.diff(np.sort(times))
+    gaps = gaps[gaps > 0]
+    if gaps.size == 0:
+        return 0.0
+    return float(np.median(gaps))
+
+
 def _column(df: pd.DataFrame, name: str) -> np.ndarray:
     """Pull one price column as float64, falling back to close then to NaN."""
     for candidate in (name, "close"):
@@ -232,6 +401,13 @@ def _fractal_indices(
     extreme actually occurred. Returning the window's right edge instead is the
     off-by-right bug this module exists to avoid.
 
+    Equal extremes count on both sides. A double top with two prints at the
+    same price is two pivots, because a strict test on one side drops the
+    earlier of them, and equal highs on a round number are the level a trader
+    is watching. A run of consecutive equal bars (a plateau) is one pivot, its
+    first bar. A bar whose whole neighbourhood equals it is flat, not a swing,
+    so a constant series yields nothing.
+
     Args:
         values: Highs for a swing high search, lows for a swing low search.
         left: Bars required to the left.
@@ -250,21 +426,37 @@ def _fractal_indices(
     win = sliding_window_view(np.ascontiguousarray(values), width)
     centre = win[:, left]
     ok = np.isfinite(centre)
+    lower = np.zeros(centre.shape, dtype=bool)
 
     if kind == "high":
         if left:
             ok &= centre >= win[:, :left].max(axis=1)
+            lower |= centre > win[:, :left].min(axis=1)
         if right:
-            # Strict on the right so a plateau resolves to one pivot, its last
-            # bar, rather than to every bar of the plateau.
-            ok &= centre > win[:, left + 1:].max(axis=1)
+            ok &= centre >= win[:, left + 1:].max(axis=1)
+            lower |= centre > win[:, left + 1:].min(axis=1)
     else:
         if left:
             ok &= centre <= win[:, :left].min(axis=1)
+            lower |= centre < win[:, :left].max(axis=1)
         if right:
-            ok &= centre < win[:, left + 1:].min(axis=1)
+            ok &= centre <= win[:, left + 1:].min(axis=1)
+            lower |= centre < win[:, left + 1:].max(axis=1)
+    if left or right:
+        ok &= lower
 
-    return np.nonzero(ok)[0].astype(np.int64) + left
+    found = np.nonzero(ok)[0].astype(np.int64) + left
+    if found.size < 2:
+        return found
+
+    # One pivot per plateau. Every bar of a run of equal values passes the test
+    # above, so the run is collapsed to its first member.
+    run_start = np.zeros(n, dtype=np.int64)
+    breaks = np.nonzero(values[1:] != values[:-1])[0] + 1
+    run_start[breaks] = breaks
+    run_start = np.maximum.accumulate(run_start)
+    first_of_run = np.concatenate(([True], run_start[found[1:]] != run_start[found[:-1]]))
+    return found[first_of_run]
 
 
 def _window(
@@ -277,15 +469,26 @@ def _window(
 ) -> dict[str, Any]:
     """Clip the frame to the visible range and measure it.
 
+    The last bar of the frame is alive. Its high and low move on every tick,
+    so it is left out of ``range``, ``top`` and ``bottom``: the significance
+    ladder is built on the range, and a range that moved with the forming bar
+    changed the pivot set on 8 of 120 synthetic ticks. The bar still counts in
+    ``mask``, ``count``, ``last_time`` and ``last_close``, because the window
+    ends where the chart ends.
+
     Returns:
-        A dict with ``mask`` (bool array over all bars), ``range``,
-        ``first_time``, ``last_time``, ``last_close`` and ``count``. All scalars
-        are zero when nothing falls inside the range.
+        A dict with ``mask`` (bool array over all bars), ``closed`` (the mask
+        with the last bar cleared), ``range``, ``top``, ``bottom``,
+        ``first_time``, ``last_time``, ``last_close`` and ``count``. All
+        scalars are zero when nothing falls inside the range.
     """
     n = int(times.size)
     empty = {
         "mask": np.zeros(n, dtype=bool),
+        "closed": np.zeros(n, dtype=bool),
         "range": 0.0,
+        "top": 0.0,
+        "bottom": 0.0,
         "first_time": 0.0,
         "last_time": 0.0,
         "last_close": 0.0,
@@ -302,8 +505,11 @@ def _window(
     if not mask.any():
         return empty
 
-    wh = highs[mask]
-    wl = lows[mask]
+    closed = mask.copy()
+    closed[n - 1] = False
+
+    wh = highs[closed]
+    wl = lows[closed]
     wt = times[mask]
     wc = closes[mask]
 
@@ -318,7 +524,10 @@ def _window(
 
     return {
         "mask": mask,
+        "closed": closed,
         "range": max(span, 0.0),
+        "top": float(top) if np.isfinite(top) else 0.0,
+        "bottom": float(bottom) if np.isfinite(bottom) else 0.0,
         "first_time": float(wt[0]),
         "last_time": float(wt[-1]),
         "last_close": last_close,
@@ -388,6 +597,10 @@ def _raw_candidates(
     measured against the visible range, because what counts as a meaningful
     retracement depends on how far the user is zoomed in.
 
+    The last bar of the frame never becomes a pivot. With ``right`` at 1 or
+    more it cannot be confirmed anyway; with ``right`` at 0 it could, and a
+    pivot on a bar that is still trading would move on every tick.
+
     Returns:
         The candidates ascending by index, and the window measurements.
     """
@@ -403,7 +616,7 @@ def _raw_candidates(
     closes = _column(df, "close")
 
     win = _window(times, highs, lows, closes, start, end)
-    mask = win["mask"]
+    closed = win["closed"]
     if win["count"] == 0:
         return [], win
 
@@ -415,10 +628,10 @@ def _raw_candidates(
 
     cands: list[_Cand] = []
     for i in hi_idx:
-        if mask[i]:
+        if closed[i]:
             cands.append(_Cand(int(i), float(times[i]), float(highs[i]), "high"))
     for i in lo_idx:
-        if mask[i]:
+        if closed[i]:
             cands.append(_Cand(int(i), float(times[i]), float(lows[i]), "low"))
     cands.sort(key=lambda c: (c.index, 0 if c.kind == "high" else 1))
     return cands, win
@@ -657,7 +870,11 @@ def envelope(
     }
 
 
-def fit_trendline(pivots: list[Pivot], tolerance_pct: float = 0.5) -> dict[str, Any]:
+def fit_trendline(
+    pivots: list[Pivot],
+    tolerance_pct: float = TOUCH_TOLERANCE_PCT,
+    required: list[Pivot] | None = None,
+) -> dict[str, Any]:
     """Find the straight line that connects the most of these pivots.
 
     Every pair of pivots defines a candidate line and the pair with the most
@@ -672,6 +889,10 @@ def fit_trendline(pivots: list[Pivot], tolerance_pct: float = 0.5) -> dict[str, 
             both sides mixed together is allowed but rarely what you want.
         tolerance_pct: How close a pivot must sit to the line to count as a
             touch, as a percentage of the line's price at that time.
+        required: Pivots that must be in the candidate set whatever the cap
+            does, typically the ones a user's named prices snapped onto. They
+            are merged with ``pivots`` (duplicates by time and price dropped)
+            and survive the most-recent cut.
 
     Returns:
         A dict with ``from`` and ``to`` (:class:`Pivot` or None), ``slope``
@@ -689,13 +910,23 @@ def fit_trendline(pivots: list[Pivot], tolerance_pct: float = 0.5) -> dict[str, 
         "touches": 0,
         "r2": 0.0,
     }
-    points = [p for p in (pivots or []) if np.isfinite(p.time) and np.isfinite(p.price)]
-    if len(points) < 2:
+
+    def usable(p: Any) -> bool:
+        return isinstance(p, Pivot) and bool(np.isfinite(p.time) and np.isfinite(p.price))
+
+    anchors = [p for p in (required or []) if usable(p)]
+    pinned = {(p.time, p.price) for p in anchors}
+    points = [p for p in (pivots or []) if usable(p) and (p.time, p.price) not in pinned]
+    if len(points) + len(anchors) < 2:
         return empty
 
     points = sorted(points, key=lambda p: p.time)
-    if len(points) > _MAX_TRENDLINE_PIVOTS:
-        points = points[-_MAX_TRENDLINE_PIVOTS:]
+    room = _MAX_TRENDLINE_PIVOTS - len(anchors)
+    if len(points) > max(room, 0):
+        points = points[-room:] if room > 0 else []
+    points = sorted(points + anchors, key=lambda p: (p.time, p.index))
+    if len(points) < 2:
+        return empty
 
     times = np.array([p.time for p in points], dtype=float)
     prices = np.array([p.price for p in points], dtype=float)
@@ -759,7 +990,8 @@ def fit_channel(
     lows: list[Pivot],
     start: float | None = None,
     end: float | None = None,
-    tolerance_pct: float = 0.5,
+    tolerance_pct: float = TOUCH_TOLERANCE_PCT,
+    crossing_tolerance_pct: float = CROSSING_TOLERANCE_PCT,
 ) -> dict[str, Any]:
     """Two straight rails that bound price: one through the swing highs, one
     through the swing lows, each on its own slope.
@@ -772,13 +1004,34 @@ def fit_channel(
 
     Selection is deterministic, which is the other half of the point: the same
     bars and the same window must give the same lines every time. Every pair of
-    pivots is a candidate and the winner is the pair whose line is crossed by
-    the fewest bars over its span (a bar whose high sits above the upper rail,
-    or whose low sits below the lower rail, by more than ``tolerance_pct``),
-    then touches the most pivots, then spans the longest, then ends latest. The
+    pivots is a candidate. A pair whose line no closed bar crosses over its
+    span (a bar whose high sits above the upper rail, or whose low sits below
+    the lower rail, by more than ``crossing_tolerance_pct``) always beats a
+    pair that is crossed. Among uncrossed pairs, one that ends near price
+    (within one window range and within 20 percent of price of the last
+    closed close, see :data:`_RAIL_REACH`) beats one that does not, then the
+    widest confirmed extent wins
+    (the run from the first pivot touching the line to the last one), then
+    the most pivot touches; among crossed pairs the fewest crossings, then the
+    latest end. The extent comes before the touches because a raw crossing
+    count let a short pair on the right of the window beat a long one whenever
+    a single wick crossed the long line. The nearness test exists because
+    uncrossed is easy for a line that leaves the chart: without it, and with
+    the old ordering too, the falling RELIANCE daily chart got a rising upper
+    rail through two early highs that ended 380 points above the last close.
+    Measured on 300 random synthetic frames at the same 0.5 percent crossing
+    slack: the channel covered less than half the visible window 33 times with
+    the old ordering and 30 times with this one, the 10th percentile of
+    coverage rose from 0.473 to 0.512 and the median held at 0.839. The
     forming bar is left out of the crossing count: it is still moving, and a
     channel that changed shape on every tick would read as broken rather than
     live.
+
+    Nothing forces the rails apart. When the upper rail sits at or below the
+    lower one anywhere over their common span, price has already resolved the
+    structure (a triangle that broke, say) and ``shape`` is "crossed" with a
+    zero ``width_right``. The rails are still returned, because they are real
+    structure, but a caller must not narrate them as a channel.
 
     Args:
         df: Cleaned OHLCV frame with a DatetimeIndex.
@@ -786,17 +1039,26 @@ def fit_channel(
         lows: Swing lows, likewise.
         start: Optional lower bound in UTC seconds.
         end: Optional upper bound in UTC seconds.
-        tolerance_pct: Slack for a touch and for a crossing, as a percentage of
-            the rail's price at that bar.
+        tolerance_pct: Slack for a pivot to count as touching a rail, as a
+            percentage of the rail's price at that bar.
+        crossing_tolerance_pct: Slack before a bar counts as crossing a rail,
+            likewise. Tighter than the touch slack, and it costs coverage: on
+            the same 300 frames, 0.5 percent let 290 channels claim zero
+            crossings on both rails and 0.2 percent lets 276, and the channel
+            covers less than half the window 47 times instead of 30 (median
+            coverage 0.789 against 0.839), because a pair a wick pokes through
+            by 3 points on a 1400 stock is now a crossed pair and a shorter
+            clean one wins. That is the intended trade: a rail that price went
+            through is not a rail that bounds price.
 
     Returns:
         A dict with ``upper`` and ``lower``, each either None (fewer than two
         pivots on that side) or a dict holding ``from`` and ``to`` as
         ``{"time", "price"}``, ``slope``, ``intercept``, ``touches``,
         ``crossings``, ``from_pivot`` and ``to_pivot``; plus ``shape`` (one of
-        rising, falling, contracting, broadening, sideways) and ``width_right``,
-        the vertical distance between the rails at the right edge. All rails
-        share that right edge so they read as one structure.
+        rising, falling, contracting, broadening, sideways, crossed) and
+        ``width_right``, the vertical distance between the rails at the right
+        edge. All rails share that right edge so they read as one structure.
     """
     empty = {"upper": None, "lower": None, "shape": "sideways", "width_right": 0.0}
     if df is None or len(df) == 0:
@@ -820,6 +1082,27 @@ def fit_channel(
     right_edge = float(np.nanmax(times[mask]))
     forming = n - 1
     tol = max(float(tolerance_pct), 0.0) / 100.0
+    cross_tol = max(float(crossing_tolerance_pct), 0.0) / 100.0
+
+    # What "near price" means for a rail: within half the closed-bar range of
+    # the last closed close at the right edge. The forming bar stays out of it.
+    closed = mask.copy()
+    closed[forming] = False
+    closes = _column(df, "close")
+    if closed.any():
+        span_hi = hi[closed]
+        span_lo = lo[closed]
+        top = float(np.nanmax(span_hi)) if np.isfinite(span_hi).any() else np.nan
+        bottom = float(np.nanmin(span_lo)) if np.isfinite(span_lo).any() else np.nan
+        window_range = top - bottom if np.isfinite(top) and np.isfinite(bottom) else 0.0
+        finite_close = closes[closed][np.isfinite(closes[closed])]
+        reference = float(finite_close[-1]) if finite_close.size else np.nan
+    else:
+        window_range = 0.0
+        reference = np.nan
+    reach = max(window_range, 0.0) * _RAIL_REACH
+    if np.isfinite(reference):
+        reach = min(reach, abs(reference) * _RAIL_REACH_PCT)
 
     def side(pivots: list[Pivot], kind: str) -> dict[str, Any] | None:
         pts = sorted(
@@ -831,7 +1114,7 @@ def fit_channel(
         pt = np.array([p.time for p in pts], dtype=float)
         pp = np.array([p.price for p in pts], dtype=float)
 
-        best: tuple[int, int, float, float] | None = None
+        best: tuple[bool, bool, float, int, int, float] | None = None
         best_pair: tuple[int, int, float, float, int, int] | None = None
         for i in range(len(pts) - 1):
             for j in range(i + 1, len(pts)):
@@ -844,7 +1127,7 @@ def fit_channel(
                 span = mask & (times >= pt[i]) & (times <= right_edge)
                 span[forming] = False
                 line = slope * times + intercept
-                slack = np.abs(line) * tol
+                slack = np.abs(line) * cross_tol
                 if kind == "high":
                     crossed = span & (hi > line + slack)
                 else:
@@ -852,9 +1135,22 @@ def fit_channel(
                 crossings = int(np.count_nonzero(crossed))
 
                 fitted = slope * pt + intercept
-                touches = int(np.count_nonzero(np.abs(pp - fitted) <= np.abs(fitted) * tol))
+                hits = np.abs(pp - fitted) <= np.abs(fitted) * tol
+                touches = int(np.count_nonzero(hits))
+                # The span that counts is the run of pivots the line actually
+                # connects, first touch to last touch. Not the drawn length: a
+                # pair of two early highs on a falling chart is uncrossed only
+                # because it shoots away from price, and by drawn length it beat
+                # the falling rail that touched a pivot eighty bars later.
+                extent = float(pt[hits].max() - pt[hits].min())
 
-                score = (-crossings, touches, float(dt), float(pt[j]))
+                # Uncrossed is easy for a line that runs away from price. A rail
+                # that ends more than half the window range from the last close
+                # loses to any uncrossed rail that does not.
+                at_edge = slope * right_edge + intercept
+                near = bool(np.isfinite(reference) and abs(at_edge - reference) <= reach)
+
+                score = (crossings == 0, near, extent, touches, -crossings, float(pt[j]))
                 if best is None or score > best:
                     best = score
                     best_pair = (i, j, float(slope), float(intercept), crossings, touches)
@@ -888,8 +1184,13 @@ def fit_channel(
         l_right = lower["to"]["price"]
         gap_left = u_left - l_left
         gap_right = u_right - l_right
-        width_right = float(abs(gap_right))
-        if gap_left > 0 and gap_right > 0:
+        # Two straight lines cross inside the span exactly when the gap changes
+        # sign between its ends, so the two end checks cover the interior too.
+        if gap_left <= 0 or gap_right <= 0:
+            shape = "crossed"
+            width_right = 0.0
+        else:
+            width_right = float(gap_right)
             ratio = gap_right / gap_left
             drift = ((u_right + l_right) - (u_left + l_left)) / 2.0
             reference = max(gap_left, gap_right)
@@ -916,14 +1217,19 @@ def support_resistance(
     min_touches: int = 2,
     start: float | None = None,
     end: float | None = None,
+    reference: float | None = None,
 ) -> list[dict[str, Any]]:
     """Horizontal levels where swing points cluster.
 
-    Swing highs and lows in the visible range are grouped by price. A group is a
-    level and the number of pivots in it is its touch count. Grouping is
-    agglomerative rather than histogram binning, so two pivots a rupee apart are
-    never split by an arbitrary bin edge; ``bins`` sets the width of a group as
-    a fraction of the visible range instead of placing the edges.
+    Swing highs and swing lows in the visible range are each grouped by price,
+    separately, so a level built from highs is reported as such and never has a
+    low averaged into it. A group is a level and the number of pivots in it is
+    its touch count. Grouping is agglomerative rather than histogram binning,
+    so two pivots a rupee apart are never split by an arbitrary bin edge;
+    ``bins`` sets the width of a group as a fraction of the visible range
+    instead of placing the edges. The reported price is the pivot in the group
+    nearest its mean, a price that actually printed, rather than the mean
+    itself, which moved with every change of zoom.
 
     Args:
         df: Cleaned OHLCV frame with a DatetimeIndex.
@@ -932,14 +1238,17 @@ def support_resistance(
         min_touches: Drop levels touched fewer times than this.
         start: Optional lower bound in UTC seconds.
         end: Optional upper bound in UTC seconds.
+        reference: The price ``kind`` is read against, normally the live last
+            price. None falls back to the last close in the window.
 
     Returns:
-        A list of dicts with ``price``, ``touches``, ``kind``, ``first_time``
-        and ``last_time``, sorted by strength: touch count first, most recently
-        touched first on a tie. ``kind`` is read against the last close in the
-        window, so a level above current price is resistance and one below it is
-        support, which is what a trader reads off the chart now. Empty when no
-        cluster reaches ``min_touches``.
+        A list of dicts with ``price``, ``touches``, ``kind``, ``side``,
+        ``first_time`` and ``last_time``, sorted by strength: touch count
+        first, most recently touched first on a tie. ``kind`` is "resistance"
+        for a level at or above ``reference`` and "support" below it, which is
+        what a trader reads off the chart now; ``side`` is "high" or "low",
+        which pivots the level was built from. Empty when no cluster reaches
+        ``min_touches``.
     """
     cands, win = _detect(df, DEFAULT_LEFT, DEFAULT_RIGHT, 0.0, start, end)
     if not cands or win["range"] <= 0:
@@ -953,55 +1262,74 @@ def support_resistance(
     if tolerance <= 0:
         return []
 
-    ordered = sorted(cands, key=lambda c: c.price)
-    groups: list[list[_Cand]] = [[ordered[0]]]
-    for cand in ordered[1:]:
-        if cand.price - groups[-1][0].price <= tolerance:
-            groups[-1].append(cand)
-        else:
-            groups.append([cand])
+    ref = None
+    try:
+        ref = float(reference) if reference is not None else None
+    except (TypeError, ValueError):
+        ref = None
+    if ref is None or not np.isfinite(ref):
+        ref = float(win["last_close"])
 
-    reference = float(win["last_close"])
     levels: list[dict[str, Any]] = []
-    for group in groups:
-        if len(group) < max(int(min_touches), 1):
+    for side in ("high", "low"):
+        ordered = sorted((c for c in cands if c.kind == side), key=lambda c: c.price)
+        if not ordered:
             continue
-        prices = [c.price for c in group]
-        times = [c.time for c in group]
-        price = float(sum(prices) / len(prices))
-        levels.append(
-            {
-                "price": price,
-                "touches": len(group),
-                "kind": "resistance" if price >= reference else "support",
-                "first_time": float(min(times)),
-                "last_time": float(max(times)),
-            }
-        )
+        groups: list[list[_Cand]] = [[ordered[0]]]
+        for cand in ordered[1:]:
+            if cand.price - groups[-1][0].price <= tolerance:
+                groups[-1].append(cand)
+            else:
+                groups.append([cand])
+
+        for group in groups:
+            if len(group) < max(int(min_touches), 1):
+                continue
+            prices = [c.price for c in group]
+            times = [c.time for c in group]
+            mean = float(sum(prices) / len(prices))
+            price = float(min(prices, key=lambda p: (abs(p - mean), p)))
+            levels.append(
+                {
+                    "price": price,
+                    "touches": len(group),
+                    "kind": "resistance" if price >= ref else "support",
+                    "side": side,
+                    "first_time": float(min(times)),
+                    "last_time": float(max(times)),
+                }
+            )
 
     levels.sort(key=lambda lv: (-lv["touches"], -lv["last_time"]))
     return levels
 
 
-def measured_move(env: dict[str, Any]) -> dict[str, Any]:
-    """Project the envelope's width off each boundary.
+def measured_move(channel: dict[str, Any]) -> dict[str, Any]:
+    """Project the channel's height off each rail.
 
-    The textbook rule for a band or rectangle: a break of the upper boundary
-    targets one band height above it, a break of the lower boundary targets one
-    band height below. Both boundaries are evaluated at the envelope's right
-    edge, so the targets sit where the band actually ends rather than where it
-    started.
+    The textbook rule for a channel or rectangle: a break of the upper rail
+    targets one channel height above it, a break of the lower rail targets one
+    height below. The rails measured are the rails drawn: each is evaluated at
+    the right edge the fit returned, so the breakout price is the upper rail's
+    own right-edge price and the height is the gap between the rails there.
+    An earlier version least-squares fitted the stored pivots instead and
+    evaluated at the last pivot's time, which put the measured line a median
+    11 points and at worst 394 points away from the one on screen over 200
+    synthetic frames.
 
     Args:
-        env: The dict returned by :func:`envelope`.
+        channel: The dict returned by :func:`fit_channel`, or its stored form:
+            ``upper`` and ``lower`` rails each holding ``from`` and ``to`` as
+            ``{"time", "price"}``, plus optional ``direction`` and ``shape``.
 
     Returns:
         A dict with ``width``, ``direction``, ``time`` (the right edge, UTC
-        seconds), ``target_time`` (the right edge plus the pattern's own
+        seconds), ``target_time`` (the right edge plus the channel's own
         duration, a seat for the target label), ``breakout`` and ``breakdown``
-        (the two boundary prices at the right edge), and ``upside_target`` and
-        ``downside_target``. Every value is 0.0 when the envelope has no
-        vertices.
+        (the two rail prices at the right edge), and ``upside_target`` and
+        ``downside_target``. Every value is 0.0 when either rail is missing,
+        when the rails cross (``shape`` "crossed"), or when the gap at the
+        right edge is not positive.
     """
     blank = {
         "width": 0.0,
@@ -1013,37 +1341,39 @@ def measured_move(env: dict[str, Any]) -> dict[str, Any]:
         "upside_target": 0.0,
         "downside_target": 0.0,
     }
-    if not isinstance(env, dict):
+    if not isinstance(channel, dict):
+        return blank
+    direction = str(channel.get("direction") or "sideways")
+    blank["direction"] = direction
+
+    upper = channel.get("upper")
+    lower = channel.get("lower")
+    if not isinstance(upper, dict) or not isinstance(lower, dict):
+        return blank
+    if str(channel.get("shape") or "") == "crossed":
         return blank
 
-    highs = list(env.get("highs") or [])
-    lows = list(env.get("lows") or [])
-    if not highs and not lows:
+    try:
+        breakout = float(upper["to"]["price"])
+        breakdown = float(lower["to"]["price"])
+        right_edge = float(upper["to"]["time"])
+        starts = (float(upper["from"]["time"]), float(lower["from"]["time"]))
+    except (KeyError, TypeError, ValueError):
+        return blank
+    values = (breakout, breakdown, right_edge) + starts
+    if not all(np.isfinite(v) for v in values):
         return blank
 
-    width = float(env.get("width") or 0.0)
-    first_time = float(env.get("first_time") or 0.0)
-    last_time = float(env.get("last_time") or 0.0)
-    duration = max(last_time - first_time, 0.0)
-
-    def boundary(pivots: list[Pivot], fallback: float) -> float:
-        if not pivots:
-            return fallback
-        if len(pivots) == 1:
-            return float(pivots[0].price)
-        slope, intercept = _fit_side(pivots)
-        return float(intercept + slope * last_time)
-
-    top_seed = max((p.price for p in highs), default=0.0)
-    bottom_seed = min((p.price for p in lows), default=0.0)
-    breakout = boundary(highs, bottom_seed + width)
-    breakdown = boundary(lows, top_seed - width)
+    width = breakout - breakdown
+    if width <= 0.0:
+        return blank
+    duration = max(right_edge - min(starts), 0.0)
 
     return {
-        "width": width,
-        "direction": str(env.get("direction") or "sideways"),
-        "time": last_time,
-        "target_time": last_time + duration,
+        "width": float(width),
+        "direction": direction,
+        "time": right_edge,
+        "target_time": right_edge + duration,
         "breakout": breakout,
         "breakdown": breakdown,
         "upside_target": breakout + width,
@@ -1056,6 +1386,10 @@ def snap_to_pivot(
     price: float,
     kind: str = "any",
     tolerance_pct: float = 2.0,
+    start: float | None = None,
+    end: float | None = None,
+    left: int = SNAP_LEFT,
+    right: int = SNAP_RIGHT,
 ) -> Pivot | None:
     """Map a loose number onto the real pivot near it.
 
@@ -1063,9 +1397,15 @@ def snap_to_pivot(
     Drawing at 4446 puts the anchor off the candle, so the number is snapped to
     the nearest confirmed pivot before anything is drawn. Detection is looser
     here than for drawing, two bars either side, because a remembered price is
-    often a minor swing that a three bar window discards, and the frame's own
+    often a minor swing that a three bar window discards, and the window's own
     extremes are tested as well, since an extreme inside the last two bars can
     never be a confirmed fractal.
+
+    The pool is the visible window, not the whole fetched frame, so the answer
+    does not depend on how many bars the caller happened to fetch: with the
+    frame as the pool, the same number snapped to a different bar in 13 of 60
+    trials at a 600 bar fetch versus a 300 bar one. The forming bar is never in
+    the pool; its extreme is still moving.
 
     Args:
         df: Cleaned OHLCV frame with a DatetimeIndex.
@@ -1074,12 +1414,16 @@ def snap_to_pivot(
             synonyms for "high" and "low".
         tolerance_pct: How far the real pivot may sit from the number, as a
             percentage of the number.
+        start: Optional lower bound of the pool in UTC seconds.
+        end: Optional upper bound of the pool in UTC seconds.
+        left: Bars required to the left of a pivot.
+        right: Bars required to the right of a pivot.
 
     Returns:
-        The nearest matching :class:`Pivot`, or None when nothing sits inside
-        the tolerance. Two pivots within :data:`_SNAP_TIE_PCT` of each other
-        count as equally close, and then the more prominent one wins, followed
-        by the more recent.
+        The nearest matching :class:`Pivot`, with ``kind`` set, or None when
+        nothing sits inside the tolerance. Two pivots within
+        :data:`_SNAP_TIE_PCT` of each other count as equally close, and then
+        the more prominent one wins, followed by the more recent.
     """
     try:
         target = float(price)
@@ -1093,19 +1437,25 @@ def snap_to_pivot(
     if wanted not in ("high", "low", "any"):
         wanted = "any"
 
-    cands, _ = _detect(df, SNAP_LEFT, SNAP_RIGHT, 0.0, None, None)
+    cands, win = _detect(df, left, right, 0.0, start, end)
     pool = [c for c in cands if wanted == "any" or c.kind == wanted]
 
     times = to_utc_seconds(df.index)
     highs = _column(df, "high")
     lows = _column(df, "low")
-    if times.size == len(df):
-        if wanted in ("high", "any") and np.isfinite(highs).any():
-            i = int(np.nanargmax(highs))
-            pool.append(_Cand(i, float(times[i]), float(highs[i]), "high"))
-        if wanted in ("low", "any") and np.isfinite(lows).any():
-            i = int(np.nanargmin(lows))
-            pool.append(_Cand(i, float(times[i]), float(lows[i]), "low"))
+    closed = win["closed"]
+    if times.size == len(df) and closed.any():
+        seen = {(c.index, c.kind) for c in pool}
+        if wanted in ("high", "any") and np.isfinite(highs[closed]).any():
+            masked = np.where(closed, highs, np.nan)
+            i = int(np.nanargmax(masked))
+            if (i, "high") not in seen:
+                pool.append(_Cand(i, float(times[i]), float(highs[i]), "high"))
+        if wanted in ("low", "any") and np.isfinite(lows[closed]).any():
+            masked = np.where(closed, lows, np.nan)
+            i = int(np.nanargmin(masked))
+            if (i, "low") not in seen:
+                pool.append(_Cand(i, float(times[i]), float(lows[i]), "low"))
 
     if not pool:
         return None
@@ -1122,8 +1472,8 @@ def snap_to_pivot(
     # Prominence measured toward each pivot's own extreme, so a high and a low
     # can be ranked against each other without one side always winning.
     centre = 0.0
-    if np.isfinite(highs).any() and np.isfinite(lows).any():
-        centre = (float(np.nanmax(highs)) + float(np.nanmin(lows))) / 2.0
+    if win["range"] > 0.0:
+        centre = (float(win["top"]) + float(win["bottom"])) / 2.0
 
     def prominence(c: _Cand) -> float:
         return c.price - centre if c.kind == "high" else centre - c.price

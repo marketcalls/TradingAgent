@@ -18,9 +18,14 @@
  *     history bars. sessionAnchorFor therefore reads the anchor off the last
  *     history bar, which is by definition already on the broker's own grid, and
  *     stays correct across a day boundary for any interval dividing 24 hours.
+ *     With no bar at all it answers the NSE open itself rather than the epoch,
+ *     for the same reason.
  *   - A calendar code (a month, a quarter) has no seconds at all. February is 29
  *     days in 2024 and a New York month is not a Mumbai month, so intervalSeconds
  *     answers null for one instead of a plausible-looking 2592000.
+ *   - An empty broker list is an unavailable list, not a broker with no
+ *     intervals. /intervals can fail or answer nothing, and answering "D" to
+ *     that discarded the saved interval every time the request stumbled.
  */
 
 import { tryResolveInterval, type Bar } from "openalgo-charts"
@@ -63,13 +68,22 @@ export function flattenIntervals(groups: IntervalGroups): string[] {
   return out
 }
 
-/** The interval to open on: the saved one if the broker still offers it, else 5m. */
+/** The interval charted when nothing is saved and the broker offers it. */
+export const DEFAULT_INTERVAL = "5m"
+
+/** The interval to open on: the saved one if the broker still offers it, else 5m.
+ *
+ *  With no list to check against, the saved code (or the default) is kept as it
+ *  is: forcing D on an empty list threw away the saved interval whenever the
+ *  broker's list failed to load, and the terminal then charted daily bars under
+ *  a saved 5m preference. The caller says the list was unavailable. */
 export function pickInterval(groups: IntervalGroups, saved: string | null): string {
   const all = flattenIntervals(groups)
+  if (all.length === 0) return saved ?? DEFAULT_INTERVAL
   if (saved !== null && all.includes(saved)) return saved
-  if (all.includes("5m")) return "5m"
+  if (all.includes(DEFAULT_INTERVAL)) return DEFAULT_INTERVAL
   if (groups.minutes.length > 0) return groups.minutes[0]
-  return all[0] ?? "D"
+  return all[0]
 }
 
 /** Seconds per bar for a fixed-length code, or null for calendar, count and
@@ -110,13 +124,26 @@ export function historyRange(interval: string, to: number): { from: number; to: 
   return { from: to - lookbackDays(interval) * 86400, to }
 }
 
+/** 09:15 IST on the epoch day, in UTC seconds (03:45 UTC).
+ *
+ *  Every interval this deployment offers divides 24 hours, so a bucket grid
+ *  stepped from here lands on 09:15 IST on every later day too, where a grid
+ *  stepped from the epoch puts the 10m, 30m and 1h buckets at 09:10, 09:00 and
+ *  09:00. The broker stamps daily bars at 00:00 UTC (measured against the live
+ *  history endpoint), which only the seeded path below follows; the terminal
+ *  does not subscribe live without a history bar, so this constant is the
+ *  fallback for callers of the feed that do. */
+export const NSE_OPEN_ANCHOR_SEC = 3 * 3600 + 45 * 60
+
 /** Bucket alignment for the live builder, in UTC seconds.
  *
  *  The last history bar's own open time. It is already on whatever grid the
  *  broker buckets to, so a tick inside that bar folds into it rather than
  *  opening a second bar for the same minute, and every later bucket steps from
- *  a session-aligned origin instead of from the epoch.
+ *  a session-aligned origin instead of from the epoch. With no bar the anchor
+ *  is the session open, never 0: an epoch anchor is exactly the misalignment
+ *  the seeded path exists to avoid.
  */
 export function sessionAnchorFor(lastBar: Bar | null): number {
-  return lastBar === null ? 0 : lastBar.time
+  return lastBar === null ? NSE_OPEN_ANCHOR_SEC : lastBar.time
 }

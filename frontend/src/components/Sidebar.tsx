@@ -58,7 +58,11 @@ export default function Sidebar({
           <button
             key={item.route}
             type="button"
-            onClick={() => onNavigate(item.route)}
+            onClick={() => {
+              // Already here: navigating again only pushes a duplicate history
+              // entry, and Back then appears to do nothing.
+              if (route !== item.route) onNavigate(item.route)
+            }}
             className={cn(
               "flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm",
               route === item.route

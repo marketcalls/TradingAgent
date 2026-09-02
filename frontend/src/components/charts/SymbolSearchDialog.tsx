@@ -115,8 +115,11 @@ export default function SymbolSearchDialog({ open, onSearch, onPick, onClose }: 
       return
     }
     setSearching(true)
+    // The ticket is taken at the keystroke, not when the timer fires. Taken
+    // later, a request already in flight for the previous prefix still held the
+    // newest ticket for the whole debounce window and painted its stale rows.
+    const ticket = (sequence.current += 1)
     const timer = window.setTimeout(() => {
-      const ticket = (sequence.current += 1)
       onSearch(text, exchange ?? undefined)
         .then((result) => {
           if (ticket !== sequence.current) return
@@ -174,6 +177,9 @@ export default function SymbolSearchDialog({ open, onSearch, onPick, onClose }: 
       return
     }
     if (event.key === "Enter") {
+      // Only from the field. On Close or an exchange chip, Enter is that
+      // button's own click and must not load the highlighted row instead.
+      if (document.activeElement !== inputRef.current) return
       const row = flat[active]
       if (row) {
         event.preventDefault()
@@ -291,8 +297,13 @@ export default function SymbolSearchDialog({ open, onSearch, onPick, onClose }: 
           ) : (
             <ul ref={listRef} id="symbol-search-list" role="listbox" aria-label="Search results">
               {groups.map((group) => (
-                <li key={group.exchange} role="presentation">
-                  <div className="px-2 pb-1 pt-2 text-[11px] uppercase tracking-wide text-muted-foreground">
+                // A listbox's children must be options or groups; the visible
+                // header is decoration and the group label carries the text.
+                <li key={group.exchange} role="group" aria-label={group.exchange}>
+                  <div
+                    aria-hidden="true"
+                    className="px-2 pb-1 pt-2 text-[11px] uppercase tracking-wide text-muted-foreground"
+                  >
                     {group.exchange}
                   </div>
                   <ul role="presentation">
